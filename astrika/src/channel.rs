@@ -134,6 +134,7 @@ pub struct Channel {
     pub is_cluster: bool,
     pub cluster_host: String,
     pub cluster_orig_id: String,
+    pub auth_header: Option<String>,
 
     pub nclients: AtomicUsize,
     pub nwaiters: AtomicUsize,
@@ -184,6 +185,7 @@ impl Channel {
         is_cluster: bool,
         cluster_host: String,
         cluster_orig_id: String,
+        auth_header: Option<String>,
         http_client: Client,
         key_cache: AesKeyCache,
         epoch: Instant,
@@ -239,6 +241,7 @@ impl Channel {
             is_cluster,
             cluster_host,
             cluster_orig_id,
+            auth_header,
             nclients: AtomicUsize::new(0),
             nwaiters: AtomicUsize::new(0),
             alive: AtomicBool::new(true),
@@ -285,7 +288,9 @@ impl Channel {
         if st.mode != InputMode::Idle {
             return false;
         }
-        st.ts.alloc_ring(TS * 22310);
+        // Leaner initial ring for cluster channels (~1.5 MB) vs direct sources (~4.2 MB)
+        let init_ring = if self.is_cluster { TS * 8192 } else { TS * 22310 };
+        st.ts.alloc_ring(init_ring);
         st.ts.reset_out_cc();
         st.ts.reset_psi();
         st.win_start = now_s;
@@ -993,20 +998,27 @@ enum TsOrHls {
 
 async fn run_http_ts_or_probe(ch: &Arc<Channel>, url: &str, ua: &str) -> TsOrHls {
     ch.inner.lock().mode = InputMode::Ts;
-    let conn_to = Duration::from_secs_f64(if ch.urls.len() > 1 { 4.5 } else { 8.0 });
+    let conn_to = Duration::from_secs_f64(if ch.is_cluster {
+        3.5
+    } else if ch.urls.len() > 1 {
+        4.5
+    } else {
+        8.0
+    });
     let idle_to = Duration::from_secs_f64(if ch.urls.len() > 1 { 12.0 } else { 20.0 });
 
-    let resp = match tokio::time::timeout(
-        conn_to,
-        ch.http_client
-            .get(url)
-            .header(USER_AGENT, ua)
-            .header("Accept", "*/*")
-            .header("Cache-Control", "no-cache")
-            .send(),
-    )
-    .await
-    {
+    let mut req = ch
+        .http_client
+        .get(url)
+        .header(USER_AGENT, ua)
+        .header("Accept", "*/*")
+        .header("Accept-Encoding", "identity")
+        .header("Cache-Control", "no-cache");
+    if let Some(ref ah) = ch.auth_header {
+        req = req.header(reqwest::header::AUTHORIZATION, ah.as_str());
+    }
+
+    let resp = match tokio::time::timeout(conn_to, req.send()).await {
         Ok(Ok(r)) => r,
         Ok(Err(e)) => return TsOrHls::Failed(format!("connect error: {}", e)),
         Err(_) => return TsOrHls::Failed("connect timeout".to_string()),
@@ -1598,6 +1610,7 @@ mod tests {
             false,
             String::new(),
             String::new(),
+            None,
             client,
             AesKeyCache::new(),
             Instant::now(),

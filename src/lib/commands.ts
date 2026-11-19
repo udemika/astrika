@@ -7,7 +7,7 @@ export interface UbuntuMigrateOptions {
 
 export function sanitizeGitHubOwner(raw: string): string {
   const cleaned = raw.trim().replace(/[^a-zA-Z0-9-]/g, '').replace(/^-+|-+$/g, '');
-  return cleaned.slice(0, 39) || '<ВАШ_ЛОГИН>';
+  return cleaned.slice(0, 39) || 'udemika';
 }
 
 export function sanitizeRepoName(raw: string): string {
@@ -34,7 +34,15 @@ export function buildUbuntuMigrateCommand(opts: UbuntuMigrateOptions): string {
   const owner = sanitizeGitHubOwner(opts.owner);
   const repo = sanitizeRepoName(opts.repo);
   const port = normalizePort(opts.port);
-  const repoUrl = `https://github.com/${owner}/${repo}.git`;
+  const binSubUrl = `https://raw.githubusercontent.com/${owner}/${repo}/main/astrika/astrika`;
+  const binRootUrl = `https://raw.githubusercontent.com/${owner}/${repo}/main/astrika`;
+
+  const downloadStep = [
+    `  (curl -fLo /usr/bin/astrika "${binSubUrl}" || curl -fLo /usr/bin/astrika "${binRootUrl}")`,
+    '  chmod +x /usr/bin/astrika',
+    `  astrika init ${port} --start`,
+    '  systemctl --no-pager status astrika',
+  ];
 
   if (opts.preserveConfig) {
     return [
@@ -43,26 +51,21 @@ export function buildUbuntuMigrateCommand(opts: UbuntuMigrateOptions): string {
       '  mkdir -p /etc/astrika',
       '  if [ -f /etc/astrag/astrag.conf ] && [ ! -f /etc/astrika/astrika.conf ]; then',
       '    cp -a /etc/astrag/astrag.conf /etc/astrika/astrika.conf',
-      '    echo "[+] Конфиг скопирован: /etc/astrag/astrag.conf -> /etc/astrika/astrika.conf"',
       '  fi',
       '',
       '  # 2. Останавливаем и полностью удаляем старый astrag',
       '  for u in /etc/systemd/system/astrag*.service; do',
       '    [ -e "$u" ] || continue',
-      '    svc="$(basename "$u" .service)"',
-      '    systemctl stop "$svc" 2>/dev/null || true',
-      '    systemctl disable "$svc" 2>/dev/null || true',
+      '    s="$(basename "$u" .service)"',
+      '    systemctl stop "$s" 2>/dev/null || true',
+      '    systemctl disable "$s" 2>/dev/null || true',
       '    rm -f "$u"',
       '  done',
       '  systemctl daemon-reload',
       '  rm -rf /etc/astrag /var/lib/astrag /usr/bin/astrag /usr/local/bin/astrag',
       '',
-      '  # 3. Скачиваем и устанавливаем новый Astrika (Ubuntu 20.04 / 22.04 / 24.04)',
-      '  rm -rf /tmp/astrika-install',
-      `  git clone --depth 1 "${repoUrl}" /tmp/astrika-install`,
-      `  cd /tmp/astrika-install && ./install.sh ${port}`,
-      '  rm -rf /tmp/astrika-install',
-      '  systemctl --no-pager status astrika',
+      '  # 3. Скачиваем статический бинарник Astrika и запускаем сервис (Ubuntu 20/22/24)',
+      ...downloadStep,
       '\'',
     ].join('\n');
   }
@@ -72,20 +75,16 @@ export function buildUbuntuMigrateCommand(opts: UbuntuMigrateOptions): string {
     '  # 1. Полное удаление старого astrag (сервисы, бинарник, конфиг)',
     '  for u in /etc/systemd/system/astrag*.service; do',
     '    [ -e "$u" ] || continue',
-    '    svc="$(basename "$u" .service)"',
-    '    systemctl stop "$svc" 2>/dev/null || true',
-    '    systemctl disable "$svc" 2>/dev/null || true',
+    '    s="$(basename "$u" .service)"',
+    '    systemctl stop "$s" 2>/dev/null || true',
+    '    systemctl disable "$s" 2>/dev/null || true',
     '    rm -f "$u"',
     '  done',
     '  systemctl daemon-reload',
     '  rm -rf /etc/astrag /var/lib/astrag /usr/bin/astrag /usr/local/bin/astrag',
     '',
-    '  # 2. Чистая установка Astrika (Ubuntu 20.04 / 22.04 / 24.04)',
-    '  rm -rf /tmp/astrika-install',
-    `  git clone --depth 1 "${repoUrl}" /tmp/astrika-install`,
-    `  cd /tmp/astrika-install && ./install.sh ${port}`,
-    '  rm -rf /tmp/astrika-install',
-    '  systemctl --no-pager status astrika',
+    '  # 2. Чистая установка статического Astrika (Ubuntu 20/22/24)',
+    ...downloadStep,
     '\'',
   ].join('\n');
 }

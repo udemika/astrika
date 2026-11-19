@@ -150,7 +150,7 @@ export default function App() {
   const [showOauthGuide, setShowOauthGuide] = useState(true);
 
   // Ubuntu migration generator state
-  const [ubuntuOwner, setUbuntuOwner] = useState('');
+  const [ubuntuOwner, setUbuntuOwner] = useState('udemika');
   const [ubuntuPort, setUbuntuPort] = useState('8000');
   const [preserveConfig, setPreserveConfig] = useState(true);
 

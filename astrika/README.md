@@ -1,72 +1,117 @@
-# Astrika
+# Astrika — Нативный однофайловый Rust-сервер цифрового ТВ и IPTV
 
-Высокопроизводительный асинхронный IPTV-стриминг сервер на **Rust** (полный безопасный и оптимизированный преемник `astasy`/`astrag`), скомпилированный в **единый статический бинарник (`x86_64-unknown-linux-musl`)** для работы на **Ubuntu 20.04, 22.04 и 24.04** без внешних библиотек (`glibc`/`libssl` не требуются).
+Автономный однофайловый асинхронный сервер приёма, буферизации и раздачи цифровых телевизионных потоков (**MPEG-TS / HLS / HTTP / HTTPS / UDP / RTP**) со встроенной веб-панелью управления — преемник **`udemika/astasy` (`astrag`)**, переписанный полностью на **Rust** (исходники в `src/`).
 
-## Что исправлено и оптимизировано (без роста потребления RAM/CPU)
+### Ключевые особенности `Astrika`
 
-1. **Безопасность и стабильность**
-   - Устранён блокирующий PBKDF2-SHA256 (600 000 итераций) в основном цикле: кэш верификации (ограничен 1024 записями, ~128 КБ RAM, TTL + мгновенная инвалидация по `config_gen`) + вынос cache-miss в `spawn_blocking`.
-   - Устранён DoS на `?token=`: мгновенный `O(1)` поиск по `token_index` вместо линейного перебора пользователей с PBKDF2.
-   - Закрыта уязвимость отсутствующей проверки прав в `/api/cluster-control` — теперь требуется авторизация администратора.
-   - Полная memory-safety на Rust (нет переполнений буфера, use-after-free, гонок данных).
-   - Неблокирующая атомарная запись конфига (`tmp` + `fsync` + `rename` в отдельном пуле).
-
-2. **Ускорение запуска телеканалов (Zapping)**
-   - **HTTP/1.1 Keep-Alive + пул соединений + TLS session resumption** (`reqwest` + `rustls` с `pool_max_idle_per_host(4)`): убраны постоянные TCP+TLS рукопожатия на каждый плейлист и сегмент.
-   - **Холодный старт HLS с 1-го сегмента**: плейлист отдаётся сразу после готовности 1-го сегмента, а клиенты просыпаются мгновенно через `tokio::sync::Notify` (0 мс ожидания вместо 40 мс опроса).
-   - **Кэширование выбранного Master Variant URL** при засыпании канала в `IN_IDLE` — при повторном включении канала сразу грузится Media-плейлист.
-   - **Адаптивный параллелизм HLS-сегментов** (до 3 на старте, 2 в установившемся режиме) + параллельная предзагрузка AES-128 ключа и сегмента + общий ограниченный кэш ключей (256 записей).
-   - **Ускоренный MPEG-TS детектор ключевых кадров**: SIMD `memchr`, просмотр до 2 TS-пакетов PES для H.264/HEVC/MPEG-2 и быстрый пропуск неизменных PAT/PMT по `version_number`.
-
-3. **Оптимизация парсинга и кэширования**
-   - Однопроходный zero-copy парсер M3U8 + поддержка `gzip` + Conditional GET (`ETag`/`If-None-Match` → `304 Not Modified`).
-   - Встроенный DNS-кэш (до 512 доменов, TTL 120с, stale-while-revalidate 300с, negative cache 10с, singleflight-коалесинг).
-   - `O(1)` индексы для каналов, пользователей, токенов и кластерных алиасов (`HashMap`/`DashMap`).
-   - Кэширование сгенерированных выходных HLS-плейлистов, глобальных `playlist.m3u8` / `playlist.xspf` и `ETag`/`304` для Web UI.
-
-4. **Минимальное потребление ресурсов сервера**
-   - В состоянии `IN_IDLE` канал **не держит ни кольцевой буфер TS, ни сетевых задач** (0 байт буферов, 0% CPU).
-   - Zero-copy сегменты `Arc<Bytes>` (общий буфер на всех клиентов без копирования памяти).
-   - Ограниченное число воркеров Tokio (`clamp(cpus, 2, 4)`, настраивается через `ASTRIKA_WORKERS`), компактный стек 1 МБ.
-   - Нулевой расход CPU на WebSocket-телеметрию, когда в Web UI никто не подключён.
+- **Один полностью статический ELF-бинарник `astrika` (~4.8 МБ, `x86_64-unknown-linux-musl`, `static-pie`)** — никаких зависимостей Python, `libssl`, `glibc` и распаковки в `/opt`. Работает «из коробки» на **Ubuntu 20.04 / 22.04 / 24.04 LTS**, Debian 10–12+, AlmaLinux / Rocky, Alpine.
+- **Ускоренный запуск телеканалов (Zapping)** — HTTP/1.1 Keep-Alive с пулом соединений (`pool_max_idle_per_host=4`) и TLS session resumption (`rustls`), холодный старт HLS сразу с 1-го сегмента, мгновенное пробуждение подписчиков через `tokio::sync::Notify` (0 мс вместо 40 мс опроса), кэширование Variant URL между засыпаниями канала, адаптивный параллелизм HLS (3 на старте / 2 в работе) + параллельная загрузка AES-128 ключа.
+- **Оптимизированный парсинг и кэширование** — однопроходный zero-copy парсер M3U8 + `gzip` + Conditional GET (`304 Not Modified`), встроенный DNS-кэш (до 512 доменов, TTL 120с, stale-while-revalidate 300с, singleflight), `O(1)` индексы каналов/пользователей/токенов, кэширование глобальных и выходных плейлистов, SIMD `memchr` поиск ключевых кадров H.264/HEVC/MPEG-2 и быстрый пропуск неизменных PAT/PMT по `version_number`.
+- **Безопасность и стабильность** — верификация PBKDF2-SHA256 (600 000 раундов) кэшируется и вынесена в `spawn_blocking` (не блокирует стриминг), устранён DoS на `?token=`, закрыта проверка прав администратора в `/api/cluster-control`, неблокирующее атомарное сохранение конфига.
+- **Минимальное потребление RAM и CPU** — режим «По запросу» (`IN_IDLE`: 0% CPU, 0 байт TS-буферов; **~14 МБ RSS при 100 настроенных каналах**), zero-copy сегменты `Arc<Bytes>`, компактный Tokio runtime (`clamp(cpus, 2, 4)`, стек 1 МБ), встроенный gzip-веб-интерфейс (`ETag` / `304`).
+- **Полная совместимость с `astrag` / `astasy`** — конфиг `/etc/astrag/astrag.conf` автоматически переносится в `/etc/astrika/astrika.conf`, сохраняются все каналы, пользователи, API `/control/`, `/play/*`, `/live/*` и кластер.
 
 ---
 
-## Быстрая установка на Ubuntu 20.04 / 22.04 / 24.04
+## Установка на сервер (Ubuntu 20.04 / 22.04 / 24.04, Debian 10–12+, любой Linux `x86_64`)
+
+### Вариант 1: Установка одним бинарником `astrika` (рекомендуется)
+
+Скачайте готовый статический ELF-бинарник `astrika` из репозитория `udemika/astrika` в `/usr/bin/astrika`, сделайте его исполняемым и запустите системный сервис:
 
 ```bash
-git clone https://github.com/<ВАШ_ЛОГИН>/astrika.git
-cd astrika
-sudo ./install.sh
+sudo curl -fLo /usr/bin/astrika https://raw.githubusercontent.com/udemika/astrika/main/astrika/astrika
+sudo chmod +x /usr/bin/astrika
+sudo astrika init 8000 --start
 ```
 
-Если на сервере уже стоял `astrag` (`/etc/astrag/astrag.conf`), команда `astrika init` автоматически перенесёт конфигурацию в `/etc/astrika/astrika.conf`.
-
-## Сборка статического бинарника вручную
+#### То же самое одной командой (быстрая установка и автозапуск):
 
 ```bash
-sudo apt-get update && sudo apt-get install -y musl-tools
+sudo curl -fLo /usr/bin/astrika https://raw.githubusercontent.com/udemika/astrika/main/astrika/astrika && sudo chmod +x /usr/bin/astrika && sudo astrika init 8000 --start
+```
+
+> В `htop` работает один нативный процесс **`astrika`**. Если на сервере был `/etc/astrag/astrag.conf`, команда `astrika init` автоматически скопирует его в `/etc/astrika/astrika.conf`.
+
+---
+
+### Переход со старого `astrag` на `astrika` одной командой (удаление `astrag` + сохранение каналов и пользователей)
+
+```bash
+sudo bash -euo pipefail -c 'mkdir -p /etc/astrika; [ -f /etc/astrag/astrag.conf ] && [ ! -f /etc/astrika/astrika.conf ] && cp -a /etc/astrag/astrag.conf /etc/astrika/astrika.conf; for u in /etc/systemd/system/astrag*.service; do [ -e "$u" ] || continue; s=$(basename "$u" .service); systemctl stop "$s" 2>/dev/null || true; systemctl disable "$s" 2>/dev/null || true; rm -f "$u"; done; systemctl daemon-reload; rm -rf /etc/astrag /var/lib/astrag /usr/bin/astrag /usr/local/bin/astrag; curl -fLo /usr/bin/astrika https://raw.githubusercontent.com/udemika/astrika/main/astrika/astrika && chmod +x /usr/bin/astrika && astrika init 8000 --start'
+```
+
+---
+
+### Вариант 2: Быстрая установка через `install.sh`
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/udemika/astrika/main/astrika/install.sh | sudo bash -s -- --start --port 8000
+```
+
+---
+
+### Вариант 3: Сборка из исходников Rust (`src/`)
+
+```bash
+sudo apt-get update && sudo apt-get install -y musl-tools curl git
+curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal
+source "$HOME/.cargo/env"
+git clone --depth 1 https://github.com/udemika/astrika.git
+cd astrika/astrika
 ./build-static.sh
+sudo install -m 0755 astrika /usr/bin/astrika
+sudo astrika init 8000 --start
 ```
 
-## Перенос в новый репозиторий `astrika`
+---
+
+## Вход в веб-интерфейс
+
+Откройте в браузере:
+
+```text
+http://<IP_ВАШЕГО_СЕРВЕРА>:8000/
+```
+
+Данные для входа по умолчанию (для новой установки):
+
+- **Логин**: `admin`
+- **Пароль**: `admin`
+
+---
+
+## Управление сервисом и конфигурацией
 
 ```bash
-cd astrika
-git init -b main
-git add .
-git commit -m "Initial release: Astrika Rust IPTV server"
-git remote add origin https://github.com/<ВАШ_ЛОГИН>/astrika.git
-git push -u origin main
+# Управление systemd
+sudo systemctl start astrika
+sudo systemctl stop astrika
+sudo systemctl restart astrika
+sudo systemctl reload astrika     # горячая перечитка конфига (SIGHUP)
+sudo systemctl status astrika
+sudo journalctl -u astrika -f
+
+# Второй независимый экземпляр на другом порту (например, 8001):
+sudo astrika init 8001 --start
+sudo astrika remove 8001 --purge
+
+# Сброс пароля администратора через консоль (PBKDF2-SHA256):
+sudo astrika reset-password admin StrongPass2026
+sudo systemctl restart astrika
+
+# Обновление бинарника:
+sudo curl -fLo /usr/bin/astrika https://raw.githubusercontent.com/udemika/astrika/main/astrika/astrika && sudo chmod +x /usr/bin/astrika && sudo systemctl restart astrika
+
+# Полное удаление:
+sudo astrika purge
 ```
 
-## Управление сервисом и CLI
+## Переменные окружения (опционально)
 
-```bash
-astrika --version
-sudo astrika init 8000                   # создать и запустить systemd-сервис
-sudo astrika reset-password admin <PASS> # сменить пароль (PBKDF2-SHA256)
-sudo systemctl reload astrika            # горячая перечитка конфига (SIGHUP)
-sudo astrika remove 8000                 # удалить сервис
-sudo astrika purge                       # полное удаление
-```
+| Переменная | По умолчанию | Описание |
+| --- | --- | --- |
+| `ASTRIKA_CONFIG_FILE` | `/etc/astrika/astrika.conf` | Путь к файлу конфигурации |
+| `ASTRIKA_WORKERS` | `clamp(cpus, 2, 4)` | Число рабочих потоков Tokio |
+| `ASTRIKA_VERIFY_TLS` | `0` | `1` — строгая проверка TLS-сертификатов источников |
+| `ASTRIKA_DISABLE_EXTRA_PORTS` | `0` | `1` — отключить дополнительные порты HTTP-выходов |

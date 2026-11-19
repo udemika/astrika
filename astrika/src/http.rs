@@ -80,6 +80,7 @@ struct ClusterStream {
     eff_id: String,
     orig_id: String,
     host_port: String,
+    auth_header: Option<String>,
     cfg: Value,
 }
 
@@ -115,8 +116,9 @@ pub struct AppState {
     // Extra port listeners (port -> task handle)
     extra_listeners: Mutex<HashMap<u16, JoinHandle<()>>>,
 
-    // Global shutdown signal
+    // Global shutdown & immediate cluster sync trigger
     pub shutdown: Arc<Notify>,
+    pub cluster_sync_notify: Arc<Notify>,
     pub stopping: AtomicBool,
 }
 
@@ -127,7 +129,7 @@ impl AppState {
         let http_client = Client::builder()
             .dns_resolver(dns)
             .danger_accept_invalid_certs(!verify_tls)
-            .pool_max_idle_per_host(4)
+            .pool_max_idle_per_host(16)
             .pool_idle_timeout(Duration::from_secs(45))
             .tcp_nodelay(true)
             .tcp_keepalive(Duration::from_secs(30))
@@ -161,6 +163,7 @@ impl AppState {
             ws_count: AtomicUsize::new(0),
             extra_listeners: Mutex::new(HashMap::new()),
             shutdown: Arc::new(Notify::new()),
+            cluster_sync_notify: Arc::new(Notify::new()),
             stopping: AtomicBool::new(false),
         });
 
@@ -294,6 +297,7 @@ impl AppState {
                     false,
                     String::new(),
                     String::new(),
+                    None,
                     self.http_client.clone(),
                     self.key_cache.clone(),
                     self.epoch,
@@ -366,6 +370,7 @@ impl AppState {
         self.playlist_cache.clear();
         self.sync_local_engines(rebuild);
         self.sync_extra_ports();
+        self.cluster_sync_notify.notify_one();
 
         if persist {
             atomic_save_config_async(self.config_path.clone(), validated).await?;
@@ -450,6 +455,7 @@ impl AppState {
             false,
             String::new(),
             String::new(),
+            None,
             self.http_client.clone(),
             self.key_cache.clone(),
             self.epoch,
@@ -1082,12 +1088,25 @@ async fn handle_media_play_ts(
             id: sess_id,
         };
 
-        // 1. Wait for first keyframe + PAT/PMT (up to 3.5s, waking IMMEDIATELY on Notify!)
-        let kf_deadline = Instant::now() + Duration::from_millis(3500);
+        // 1. Wait for first keyframe + PAT/PMT (waking IMMEDIATELY on Notify!)
+        // For cluster channels, the remote server already aligned its stream on PAT+PMT+Keyframe,
+        // so avoid double-buffering/double-GOP stalls!
+        let wait_start = Instant::now();
+        let kf_deadline = wait_start
+            + Duration::from_millis(if ch_task.is_cluster { 2000 } else { 3500 });
         loop {
             let ready = {
                 let st = ch_task.inner.lock();
-                st.ts.kf_cnt > 0 && st.ts.has_psi()
+                if st.ts.kf_cnt > 0 && st.ts.has_psi() {
+                    true
+                } else if ch_task.is_cluster {
+                    let el = wait_start.elapsed();
+                    (st.ts.has_psi() && st.ts.wpos > 0 && el >= Duration::from_millis(150))
+                        || (st.ts.wpos >= (crate::ts::TS * 8) as u64
+                            && el >= Duration::from_millis(350))
+                } else {
+                    false
+                }
             };
             if ready || Instant::now() >= kf_deadline || !ch_task.alive.load(Ordering::Acquire) {
                 break;
@@ -1096,7 +1115,7 @@ async fn handle_media_play_ts(
             tokio::select! {
                 _ = ch_task.data_notify.notified() => {},
                 _ = cancel.notified() => return,
-                _ = tokio::time::sleep(rem.min(Duration::from_millis(200))) => {},
+                _ = tokio::time::sleep(rem.min(Duration::from_millis(120))) => {},
             }
         }
 
@@ -1105,7 +1124,11 @@ async fn handle_media_play_ts(
         let prefix: Vec<u8>;
         {
             let st = ch_task.inner.lock();
-            pos = st.ts.pick_start(ch_task.now_s());
+            if ch_task.is_cluster && st.ts.wpos > 0 && st.ts.wpos - st.ts.ring_low() <= 256 * 1024 {
+                pos = st.ts.ring_low();
+            } else {
+                pos = st.ts.pick_start(ch_task.now_s());
+            }
             prefix = st.ts.client_prefix(pos);
         }
         if !prefix.is_empty() && tx.send(Ok(Frame::data(Bytes::from(prefix)))).await.is_err() {
@@ -1196,9 +1219,6 @@ async fn handle_media_play_hls(
     let Some(rsid) = state.resolve_stream_id(sid, host_hint) else {
         return detail_resp(StatusCode::NOT_FOUND, "Stream not found", None);
     };
-    let Some(ch) = state.ensure_channel_started(&rsid) else {
-        return detail_resp(StatusCode::CONFLICT, "Stream disabled or has no input", None);
-    };
     if query_has(ctx.query, "udp") {
         return detail_resp(
             StatusCode::NOT_IMPLEMENTED,
@@ -1221,6 +1241,19 @@ async fn handle_media_play_hls(
             .body(full_body(body))
             .unwrap();
     }
+
+    // Fast-path for cluster channels: proxy HLS playlist directly from remote cluster node!
+    // Eliminates double-buffering and 2-6s local re-segmentation delay (0 extra local RAM).
+    let cluster_info = state.cluster_streams.read().get(&rsid).cloned();
+    if let Some(cs) = cluster_info {
+        if let Some(resp) = proxy_cluster_hls_playlist(state, &cs, &rsid, ctx, &tqs).await {
+            return resp;
+        }
+    }
+
+    let Some(ch) = state.ensure_channel_started(&rsid) else {
+        return detail_resp(StatusCode::CONFLICT, "Stream disabled or has no input", None);
+    };
 
     let was_idle = ch.wake();
     let now_s = ch.now_s();
@@ -1314,6 +1347,15 @@ async fn handle_media_play_seg(
     let Some(rsid) = state.resolve_stream_id(sid, host_hint) else {
         return detail_resp(StatusCode::NOT_FOUND, "Stream not found", None);
     };
+
+    // Fast-path for cluster HLS segments: proxy directly over warm Keep-Alive pool (0 local RAM)
+    let cluster_info = state.cluster_streams.read().get(&rsid).cloned();
+    if let Some(cs) = cluster_info {
+        if let Some(resp) = proxy_cluster_hls_segment(state, &cs, seg_name, ctx).await {
+            return resp;
+        }
+    }
+
     let Some(ch) = state.ensure_channel_started(&rsid) else {
         return detail_resp(StatusCode::CONFLICT, "Stream disabled or has no input", None);
     };
@@ -1333,6 +1375,146 @@ async fn handle_media_play_seg(
             full_body((*seg_bytes).clone())
         })
         .unwrap()
+}
+
+fn rewrite_cluster_hls_playlist(raw: &str, rsid: &str, tqs: &str) -> String {
+    let mut out = String::with_capacity(raw.len() + 256);
+    for line in raw.lines() {
+        let tr = line.trim();
+        if tr.is_empty() || tr.starts_with('#') {
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        }
+        let no_q = tr.split('?').next().unwrap_or(tr);
+        let seg_name = no_q.rsplit('/').next().unwrap_or(no_q);
+        if !seg_name.is_empty() && seg_name.ends_with(".ts") {
+            out.push_str("/play/");
+            out.push_str(rsid);
+            out.push_str("/segment/");
+            out.push_str(seg_name);
+            out.push_str(tqs);
+            out.push('\n');
+        } else {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out
+}
+
+async fn proxy_cluster_hls_playlist(
+    state: &AppState,
+    cs: &ClusterStream,
+    rsid: &str,
+    ctx: &MediaReqCtx<'_>,
+    tqs: &str,
+) -> Option<Response<RespBody>> {
+    let url = format!("http://{}/play/{}.m3u8", cs.host_port, cs.orig_id);
+    let mut req = state
+        .http_client
+        .get(&url)
+        .header(USER_AGENT, "Astrika/2.1");
+    if let Some(ref ah) = cs.auth_header {
+        req = req.header(AUTHORIZATION, ah.as_str());
+    }
+    if let Some(inm) = ctx.if_none_match {
+        req = req.header("If-None-Match", inm);
+    }
+
+    let resp = tokio::time::timeout(Duration::from_secs(10), req.send())
+        .await
+        .ok()?
+        .ok()?;
+    let st_code = resp.status().as_u16();
+    if st_code == 304 {
+        let mut b = Response::builder()
+            .status(StatusCode::NOT_MODIFIED)
+            .header(ACCESS_CONTROL_ALLOW_ORIGIN, "*");
+        if let Some(et) = resp.headers().get(ETAG).and_then(|v| v.to_str().ok()) {
+            b = b.header(ETAG, et);
+        }
+        return Some(b.body(empty_body()).unwrap());
+    }
+    if st_code == 503 {
+        return Some(detail_resp(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "HLS segments not yet available",
+            Some("1"),
+        ));
+    }
+    if st_code != 200 {
+        return None;
+    }
+
+    let etag = resp
+        .headers()
+        .get(ETAG)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    let text = resp.text().await.ok()?;
+    if !text.contains("#EXTM3U") {
+        return None;
+    }
+    let rewritten = rewrite_cluster_hls_playlist(&text, rsid, tqs);
+    let mut b = Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "application/vnd.apple.mpegurl")
+        .header(CACHE_CONTROL, "no-store, no-cache, must-revalidate")
+        .header(ACCESS_CONTROL_ALLOW_ORIGIN, "*");
+    if let Some(et) = etag {
+        b = b.header(ETAG, et);
+    }
+    Some(
+        b.body(if ctx.head_only {
+            empty_body()
+        } else {
+            full_body(rewritten)
+        })
+        .unwrap(),
+    )
+}
+
+async fn proxy_cluster_hls_segment(
+    state: &AppState,
+    cs: &ClusterStream,
+    seg_name: &str,
+    ctx: &MediaReqCtx<'_>,
+) -> Option<Response<RespBody>> {
+    let url = format!(
+        "http://{}/play/{}/segment/{}",
+        cs.host_port, cs.orig_id, seg_name
+    );
+    let mut req = state
+        .http_client
+        .get(&url)
+        .header(USER_AGENT, "Astrika/2.1")
+        .header("Accept-Encoding", "identity");
+    if let Some(ref ah) = cs.auth_header {
+        req = req.header(AUTHORIZATION, ah.as_str());
+    }
+
+    let resp = tokio::time::timeout(Duration::from_secs(8), req.send())
+        .await
+        .ok()?
+        .ok()?;
+    if resp.status().as_u16() != 200 {
+        return None;
+    }
+    let bytes = resp.bytes().await.ok()?;
+    Some(
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(CONTENT_TYPE, "video/mp2t")
+            .header(CACHE_CONTROL, "public, max-age=60")
+            .header(ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+            .body(if ctx.head_only {
+                empty_body()
+            } else {
+                full_body(bytes)
+            })
+            .unwrap(),
+    )
 }
 
 fn playlist_base_url(ctx: &MediaReqCtx<'_>, default_port: u16) -> String {
@@ -2602,13 +2784,16 @@ pub fn spawn_background_tasks(state: Arc<AppState>) {
         }
     });
 
-    // 2. Cluster synchronization loop (every 45s)
+    // 2. Cluster synchronization loop (immediate on config change + every 45s)
     let st2 = Arc::clone(&state);
     tokio::spawn(async move {
         let mut iv = tokio::time::interval(Duration::from_secs(45));
         loop {
             tokio::select! {
                 _ = st2.shutdown.notified() => break,
+                _ = st2.cluster_sync_notify.notified() => {
+                    sync_cluster_once(&st2).await;
+                }
                 _ = iv.tick() => {
                     sync_cluster_once(&st2).await;
                 }
@@ -2720,57 +2905,67 @@ fn emit_scan(state: &AppState, sc: &ScanEntry) {
 
 async fn sync_cluster_once(state: &Arc<AppState>) {
     let snap = state.config();
-    let Some(servers) = snap.raw.get("servers").and_then(|v| v.as_array()) else {
-        return;
-    };
-    if servers.is_empty() {
-        return;
+    let servers: Vec<Value> = snap
+        .raw
+        .get("servers")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    // Fetch all enabled cluster nodes concurrently so a slow/offline node never stalls others
+    let mut futs = Vec::new();
+    for srv in servers {
+        if !srv.is_object() || !get_bool_field(Some(&srv), "enable", true) {
+            continue;
+        }
+        let rhost = srv.get("host").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        if rhost.is_empty() {
+            continue;
+        }
+        let rport = get_u16(&srv, "port", 8000);
+        let hp = format!("{}:{}", rhost, rport);
+        let ruser = srv.get("user").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let rpass = srv.get("pass").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let auth_header = if !ruser.is_empty() {
+            let cred = if rpass.is_empty() {
+                ruser.clone()
+            } else {
+                format!("{}:{}", ruser, rpass)
+            };
+            Some(format!("Basic {}", B64.encode(cred)))
+        } else {
+            None
+        };
+        let client = state.http_client.clone();
+        futs.push(async move {
+            let mut req = client
+                .post(format!("http://{}/control/", hp))
+                .header(USER_AGENT, "Astrika/2.1")
+                .header(CONTENT_TYPE, "application/json")
+                .body("{\"cmd\":\"load\"}");
+            if let Some(ref ah) = auth_header {
+                req = req.header(AUTHORIZATION, ah.as_str());
+            }
+            let Ok(Ok(resp)) = tokio::time::timeout(Duration::from_secs(4), req.send()).await else {
+                return None;
+            };
+            if resp.status().as_u16() != 200 {
+                return None;
+            }
+            let raw_bytes = resp.bytes().await.ok()?;
+            let rcfg = serde_json::from_slice::<Value>(&raw_bytes).ok()?;
+            Some((hp, auth_header, rcfg))
+        });
     }
+
+    let results = futures_util::future::join_all(futs).await;
 
     let mut new_streams = HashMap::new();
     let mut new_aliases = HashMap::new();
     let mut new_plain = HashMap::new();
 
-    for srv in servers {
-        if !srv.is_object() || !get_bool_field(Some(srv), "enable", true) {
-            continue;
-        }
-        let rhost = srv.get("host").and_then(|v| v.as_str()).unwrap_or("");
-        if rhost.is_empty() {
-            continue;
-        }
-        let rport = get_u16(srv, "port", 8000);
-        let hp = format!("{}:{}", rhost, rport);
-        let ruser = srv.get("user").and_then(|v| v.as_str()).unwrap_or("");
-        let rpass = srv.get("pass").and_then(|v| v.as_str()).unwrap_or("");
-
-        let mut req = state
-            .http_client
-            .post(format!("http://{}/control/", hp))
-            .header(USER_AGENT, "Astrika/2.1")
-            .header(CONTENT_TYPE, "application/json")
-            .body("{\"cmd\":\"load\"}");
-        if !ruser.is_empty() {
-            let cred = if rpass.is_empty() {
-                ruser.to_string()
-            } else {
-                format!("{}:{}", ruser, rpass)
-            };
-            req = req.header(AUTHORIZATION, format!("Basic {}", B64.encode(cred)));
-        }
-
-        let Ok(Ok(resp)) = tokio::time::timeout(Duration::from_secs(6), req.send()).await else {
-            continue;
-        };
-        if resp.status().as_u16() != 200 {
-            continue;
-        }
-        let Ok(raw_bytes) = resp.bytes().await else {
-            continue;
-        };
-        let Ok(rcfg) = serde_json::from_slice::<Value>(&raw_bytes) else {
-            continue;
-        };
+    for item in results.into_iter().flatten() {
+        let (hp, auth_header, rcfg) = item;
         let Some(rms) = rcfg.get("make_stream").and_then(|v| v.as_array()) else {
             continue;
         };
@@ -2790,26 +2985,36 @@ async fn sync_cluster_once(state: &Arc<AppState>) {
             proxied["input"] = json!([play_url]);
 
             new_aliases.insert((hp.clone(), orig_id.to_string()), eff_id.clone());
-            new_plain.entry(orig_id.to_string()).or_insert_with(|| eff_id.clone());
+            new_plain
+                .entry(orig_id.to_string())
+                .or_insert_with(|| eff_id.clone());
 
             let name = s.get("name").and_then(|v| v.as_str()).unwrap_or(orig_id);
-            let ch = Channel::new(
-                eff_id.clone(),
-                name.to_string(),
-                vec![play_url],
-                vec![],
-                snap.hls_seg_dur,
-                snap.hls_seg_keep,
-                false,
-                20.0,
-                true,
-                hp.clone(),
-                orig_id.to_string(),
-                state.http_client.clone(),
-                state.key_cache.clone(),
-                state.epoch,
-            );
-            if !state.channels.contains_key(&eff_id) {
+            let needs_insert = match state.channels.get(&eff_id) {
+                Some(existing) => existing.name != name || existing.auth_header != auth_header,
+                None => true,
+            };
+            if needs_insert {
+                if let Some((_, old)) = state.channels.remove(&eff_id) {
+                    old.shutdown();
+                }
+                let ch = Channel::new(
+                    eff_id.clone(),
+                    name.to_string(),
+                    vec![play_url],
+                    vec![],
+                    snap.hls_seg_dur,
+                    snap.hls_seg_keep,
+                    false,
+                    20.0,
+                    true,
+                    hp.clone(),
+                    orig_id.to_string(),
+                    auth_header.clone(),
+                    state.http_client.clone(),
+                    state.key_cache.clone(),
+                    state.epoch,
+                );
                 state.channels.insert(eff_id.clone(), ch);
             }
             new_streams.insert(
@@ -2818,6 +3023,7 @@ async fn sync_cluster_once(state: &Arc<AppState>) {
                     eff_id,
                     orig_id: orig_id.to_string(),
                     host_port: hp.clone(),
+                    auth_header: auth_header.clone(),
                     cfg: proxied,
                 },
             );

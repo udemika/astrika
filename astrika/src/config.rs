@@ -562,16 +562,22 @@ pub fn stream_keep_active(s: &Value) -> (bool, f64) {
         .filter(|&d| (5.0..=3600.0).contains(&d))
         .unwrap_or(20.0);
 
-    // UDP/RTP output forces keep_active
-    if let Some(outs) = s.get("output").and_then(|o| o.as_array()) {
-        for o in outs {
-            if let Some(u) = o.as_str() {
-                let low = u.trim().to_ascii_lowercase();
-                if low.starts_with("udp://") || low.starts_with("rtp://") {
-                    ka = true;
+    // Any configured output URL keeps the stream permanently active (Cesbo Astra behavior)
+    match s.get("output") {
+        Some(Value::Array(outs)) => {
+            for o in outs {
+                if let Some(u) = o.as_str() {
+                    if !u.trim().is_empty() {
+                        ka = true;
+                        break;
+                    }
                 }
             }
         }
+        Some(Value::String(u)) if !u.trim().is_empty() => {
+            ka = true;
+        }
+        _ => {}
     }
     if let Some(ins) = s.get("input").and_then(|i| i.as_array()) {
         for inp in ins {
@@ -632,5 +638,20 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("user:pass"));
+
+        // Output URL forces keep_active = true (Cesbo Astra behavior), empty output stays idle
+        assert!(stream_keep_active(&validated["make_stream"][0]).0);
+        let idle_stream = json!({
+            "id": "ch2",
+            "input": ["http://10.0.0.1/live.ts"],
+            "output": []
+        });
+        assert!(!stream_keep_active(&idle_stream).0);
+        let str_out_stream = json!({
+            "id": "ch3",
+            "input": ["http://10.0.0.1/live.ts"],
+            "output": "http://0.0.0.0:8000/live/ch3"
+        });
+        assert!(stream_keep_active(&str_out_stream).0);
     }
 }

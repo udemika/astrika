@@ -12,7 +12,7 @@ import {
 test('sanitizes GitHub owner and repository names safely', () => {
   assert.equal(sanitizeGitHubOwner('  udemika  '), 'udemika');
   assert.equal(sanitizeGitHubOwner('bad;rm -rf /'), 'badrm-rf');
-  assert.equal(sanitizeGitHubOwner('   '), '<ВАШ_ЛОГИН>');
+  assert.equal(sanitizeGitHubOwner('   '), 'udemika');
 
   assert.equal(sanitizeRepoName('astrika'), 'astrika');
   assert.equal(sanitizeRepoName('..astrika/bad'), 'astrikabad');
@@ -37,12 +37,14 @@ test('preserveConfig Ubuntu command copies astrag.conf before removing astrag', 
 
   const copyIdx = cmd.indexOf('cp -a /etc/astrag/astrag.conf /etc/astrika/astrika.conf');
   const rmIdx = cmd.indexOf('rm -rf /etc/astrag /var/lib/astrag /usr/bin/astrag');
-  const cloneIdx = cmd.indexOf('https://github.com/udemika/astrika.git');
+  const dlIdx = cmd.indexOf(
+    'https://raw.githubusercontent.com/udemika/astrika/main/astrika/astrika'
+  );
 
   assert.ok(copyIdx > 0, 'must copy astrag.conf first');
   assert.ok(rmIdx > copyIdx, 'must remove /etc/astrag only after copying');
-  assert.ok(cloneIdx > rmIdx, 'must clone astrika after removing astrag');
-  assert.ok(cmd.includes('./install.sh 8080'));
+  assert.ok(dlIdx > rmIdx, 'must download astrika binary after removing astrag');
+  assert.ok(cmd.includes('astrika init 8080 --start'));
 });
 
 test('clean Ubuntu command purges astrag without copying old config', () => {
@@ -55,7 +57,7 @@ test('clean Ubuntu command purges astrag without copying old config', () => {
 
   assert.ok(!cmd.includes('cp -a /etc/astrag/astrag.conf'));
   assert.ok(cmd.includes('rm -rf /etc/astrag /var/lib/astrag /usr/bin/astrag'));
-  assert.ok(cmd.includes('./install.sh 8000'));
+  assert.ok(cmd.includes('astrika init 8000 --start'));
 });
 
 test('redacts tokens completely from command/error output', () => {
