@@ -5,7 +5,7 @@
 ### Ключевые особенности `Astrika`
 
 - **Один полностью статический ELF-бинарник `astrika` (~4.8 МБ, `x86_64-unknown-linux-musl`, `static-pie`)** — никаких зависимостей Python, `libssl`, `glibc` и распаковки в `/opt`. Работает «из коробки» на **Ubuntu 20.04 / 22.04 / 24.04 LTS**, Debian 10–12+, AlmaLinux / Rocky, Alpine.
-- **Ускоренный запуск телеканалов (Zapping)** — HTTP/1.1 Keep-Alive с пулом соединений (`pool_max_idle_per_host=4`) и TLS session resumption (`rustls`), холодный старт HLS сразу с 1-го сегмента, мгновенное пробуждение подписчиков через `tokio::sync::Notify` (0 мс вместо 40 мс опроса), кэширование Variant URL между засыпаниями канала, адаптивный параллелизм HLS (3 на старте / 2 в работе) + параллельная загрузка AES-128 ключа.
+- **Ускоренный запуск телеканалов (Zapping) и стабильный 4K UHD** — HTTP/1.1 Keep-Alive с пулом соединений (`pool_max_idle_per_host=16`) и TLS session resumption (`rustls`), мгновенное пробуждение подписчиков через `tokio::sync::Notify` (0 мс вместо 40 мс опроса), 2-сегментный HLS-старт без подвисания после 1-го сегмента на UHD, мгновенное авторасширение TS-буфера под 20–40 Мбит/с UHD, 6-пакетный lookahead ключевых кадров HEVC/HDR10 на точной границе `PUSI=1`, кэширование Variant URL, прямой HLS-прокси для кластера и постоянная работа каналов с указанным `output` (как в Astra Cesbo).
 - **Оптимизированный парсинг и кэширование** — однопроходный zero-copy парсер M3U8 + `gzip` + Conditional GET (`304 Not Modified`), встроенный DNS-кэш (до 512 доменов, TTL 120с, stale-while-revalidate 300с, singleflight), `O(1)` индексы каналов/пользователей/токенов, кэширование глобальных и выходных плейлистов, SIMD `memchr` поиск ключевых кадров H.264/HEVC/MPEG-2 и быстрый пропуск неизменных PAT/PMT по `version_number`.
 - **Безопасность и стабильность** — верификация PBKDF2-SHA256 (600 000 раундов) кэшируется и вынесена в `spawn_blocking` (не блокирует стриминг), устранён DoS на `?token=`, закрыта проверка прав администратора в `/api/cluster-control`, неблокирующее атомарное сохранение конфига.
 - **Минимальное потребление RAM и CPU** — режим «По запросу» (`IN_IDLE`: 0% CPU, 0 байт TS-буферов; **~14 МБ RSS при 100 настроенных каналах**), zero-copy сегменты `Arc<Bytes>`, компактный Tokio runtime (`clamp(cpus, 2, 4)`, стек 1 МБ), встроенный gzip-веб-интерфейс (`ETag` / `304`).
@@ -20,25 +20,26 @@
 Скачайте готовый статический ELF-бинарник `astrika` из репозитория `udemika/astrika` в `/usr/bin/astrika`, сделайте его исполняемым и запустите системный сервис:
 
 ```bash
-sudo curl -fLo /usr/bin/astrika https://raw.githubusercontent.com/udemika/astrika/main/astrika/astrika
-sudo chmod +x /usr/bin/astrika
+sudo curl -fLo /usr/bin/astrika.new https://raw.githubusercontent.com/udemika/astrika/main/astrika/astrika
+sudo chmod +x /usr/bin/astrika.new
+sudo mv -f /usr/bin/astrika.new /usr/bin/astrika
 sudo astrika init 8000 --start
 ```
 
 #### То же самое одной командой (быстрая установка и автозапуск):
 
 ```bash
-sudo curl -fLo /usr/bin/astrika https://raw.githubusercontent.com/udemika/astrika/main/astrika/astrika && sudo chmod +x /usr/bin/astrika && sudo astrika init 8000 --start
+sudo curl -fLo /usr/bin/astrika.new https://raw.githubusercontent.com/udemika/astrika/main/astrika/astrika && sudo chmod +x /usr/bin/astrika.new && sudo mv -f /usr/bin/astrika.new /usr/bin/astrika && sudo astrika init 8000 --start
 ```
 
-> В `htop` работает один нативный процесс **`astrika`**. Если на сервере был `/etc/astrag/astrag.conf`, команда `astrika init` автоматически скопирует его в `/etc/astrika/astrika.conf`.
+> В `htop` работает один нативный процесс **`astrika`**. Загрузка во временный файл `astrika.new` + `mv -f` гарантирует безопасную установку и обновление даже при уже запущенном сервисе (без ошибки `curl: (23) Failure writing output to destination`). Если на сервере был `/etc/astrag/astrag.conf`, команда `astrika init` автоматически скопирует его в `/etc/astrika/astrika.conf`.
 
 ---
 
 ### Переход со старого `astrag` на `astrika` одной командой (удаление `astrag` + сохранение каналов и пользователей)
 
 ```bash
-sudo bash -euo pipefail -c 'mkdir -p /etc/astrika; [ -f /etc/astrag/astrag.conf ] && [ ! -f /etc/astrika/astrika.conf ] && cp -a /etc/astrag/astrag.conf /etc/astrika/astrika.conf; for u in /etc/systemd/system/astrag*.service; do [ -e "$u" ] || continue; s=$(basename "$u" .service); systemctl stop "$s" 2>/dev/null || true; systemctl disable "$s" 2>/dev/null || true; rm -f "$u"; done; systemctl daemon-reload; rm -rf /etc/astrag /var/lib/astrag /usr/bin/astrag /usr/local/bin/astrag; curl -fLo /usr/bin/astrika https://raw.githubusercontent.com/udemika/astrika/main/astrika/astrika && chmod +x /usr/bin/astrika && astrika init 8000 --start'
+sudo bash -euo pipefail -c 'mkdir -p /etc/astrika; [ -f /etc/astrag/astrag.conf ] && [ ! -f /etc/astrika/astrika.conf ] && cp -a /etc/astrag/astrag.conf /etc/astrika/astrika.conf; for u in /etc/systemd/system/astrag*.service; do [ -e "$u" ] || continue; s=$(basename "$u" .service); systemctl stop "$s" 2>/dev/null || true; systemctl disable "$s" 2>/dev/null || true; rm -f "$u"; done; systemctl daemon-reload; rm -rf /etc/astrag /var/lib/astrag /usr/bin/astrag /usr/local/bin/astrag; curl -fLo /usr/bin/astrika.new https://raw.githubusercontent.com/udemika/astrika/main/astrika/astrika && chmod +x /usr/bin/astrika.new && mv -f /usr/bin/astrika.new /usr/bin/astrika && astrika init 8000 --start'
 ```
 
 ---
@@ -100,8 +101,8 @@ sudo astrika remove 8001 --purge
 sudo astrika reset-password admin StrongPass2026
 sudo systemctl restart astrika
 
-# Обновление бинарника:
-sudo curl -fLo /usr/bin/astrika https://raw.githubusercontent.com/udemika/astrika/main/astrika/astrika && sudo chmod +x /usr/bin/astrika && sudo systemctl restart astrika
+# Обновление бинарника (атомарно, без остановки до перезапуска и без ошибки curl 23):
+sudo curl -fLo /usr/bin/astrika.new https://raw.githubusercontent.com/udemika/astrika/main/astrika/astrika && sudo chmod +x /usr/bin/astrika.new && sudo mv -f /usr/bin/astrika.new /usr/bin/astrika && sudo systemctl restart astrika
 
 # Полное удаление:
 sudo astrika purge

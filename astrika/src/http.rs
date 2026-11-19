@@ -1265,28 +1265,35 @@ async fn handle_media_play_hls(
         }
     }
 
-    // Fast cold-start: serve playlist as soon as 1 segment is ready when waking from IN_IDLE
-    // (or 2 segments once warm), waking immediately on ch.seg_notify!
-    let target_segs = if was_idle { 1 } else { 2 };
+    // Require 2 segments before serving the initial HLS playlist so UHD / high-bitrate players
+    // have a buffered follow-up segment and never stall right after segment 1 (RFC 8216 live edge).
+    // Fallback to 1 segment only if a single long GOP (>= 3.5s) is already ready and waited > 2.5s.
+    let target_segs = 2usize;
     let wait_secs = if was_idle {
-        (ch.seg_target * 3.0 + 6.0).max(14.0)
+        (ch.seg_target * 3.5 + 7.0).max(15.0)
     } else {
-        ch.seg_target * 2.0 + 3.0
+        ch.seg_target * 2.5 + 3.0
     };
-    let deadline = Instant::now() + Duration::from_secs_f64(wait_secs);
+    let wait_start = Instant::now();
+    let deadline = wait_start + Duration::from_secs_f64(wait_secs);
 
     ch.nwaiters.fetch_add(1, Ordering::Relaxed);
     loop {
-        let nsegs = ch.inner.lock().segs.len();
+        let (nsegs, first_dur) = {
+            let st = ch.inner.lock();
+            (st.segs.len(), st.segs.front().map(|s| s.dur).unwrap_or(0.0))
+        };
+        let now = Instant::now();
         if nsegs >= target_segs
-            || (nsegs >= 1 && Instant::now() + Duration::from_millis(1500) >= deadline)
+            || (nsegs >= 1 && first_dur >= 3.5 && wait_start.elapsed() >= Duration::from_millis(2500))
+            || (nsegs >= 1 && now + Duration::from_millis(1500) >= deadline)
         {
             break;
         }
-        if Instant::now() >= deadline || !ch.alive.load(Ordering::Acquire) {
+        if now >= deadline || !ch.alive.load(Ordering::Acquire) {
             break;
         }
-        let rem = deadline.saturating_duration_since(Instant::now());
+        let rem = deadline.saturating_duration_since(now);
         tokio::select! {
             _ = ch.seg_notify.notified() => {},
             _ = tokio::time::sleep(rem.min(Duration::from_millis(250))) => {},
@@ -1501,7 +1508,10 @@ async fn proxy_cluster_hls_segment(
     if resp.status().as_u16() != 200 {
         return None;
     }
-    let bytes = resp.bytes().await.ok()?;
+    let bytes = tokio::time::timeout(Duration::from_secs(15), resp.bytes())
+        .await
+        .ok()?
+        .ok()?;
     Some(
         Response::builder()
             .status(StatusCode::OK)

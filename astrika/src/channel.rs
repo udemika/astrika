@@ -370,6 +370,32 @@ impl Channel {
             }
             st.last_data = now_s;
 
+            // Immediate UHD ring growth: prevent 4 MB initial ring from wrapping on 15-40 Mbps UHD streams
+            // or large UHD HLS segments before tick_1s() runs (zero RAM cost for SD/HD or idle channels).
+            const MAX_RING: usize = 32 * 1024 * 1024;
+            let rcap = st.ts.rcap();
+            if rcap < MAX_RING {
+                let need_for_chunk = data.len().saturating_mul(3);
+                if need_for_chunk > rcap {
+                    let want = need_for_chunk.min(MAX_RING);
+                    st.ts.ring_resize(want);
+                } else {
+                    let elapsed = now_s - st.in_started;
+                    if elapsed > 0.05 && elapsed < 3.0 {
+                        let projected_wpos = st.ts.wpos + data.len() as u64;
+                        if projected_wpos > (rcap as u64 * 3 / 5) {
+                            let est_bps = projected_wpos as f64 / elapsed;
+                            let want = ((est_bps * 9.0) as usize)
+                                .max(rcap.saturating_mul(2))
+                                .min(MAX_RING);
+                            if want > rcap {
+                                st.ts.ring_resize(want);
+                            }
+                        }
+                    }
+                }
+            }
+
             // Split borrow cleanly via temporary std::mem::take of scratch Vecs
             let mut pkts = std::mem::take(&mut st.scratch_pkts);
             let mut kfs = std::mem::take(&mut st.scratch_kfs);
@@ -407,7 +433,8 @@ impl Channel {
         if st.segs.is_empty() {
             return None;
         }
-        let mut maxd = 1.0f64;
+        // Keep EXT-X-TARGETDURATION stable (>= seg_target, min 2s) so players don't stall when segment durations settle
+        let mut maxd = self.seg_target.max(2.0);
         for s in &st.segs {
             if s.dur > maxd {
                 maxd = s.dur;
@@ -529,14 +556,20 @@ impl Channel {
         st.ts.scrambled = st.ts.scr_win;
         st.ts.scr_win = false;
 
-        if now_s >= st.next_resize {
-            st.next_resize = now_s + 5.0;
-            let bps = st.bitrate.max(st.ts.pcr_bitrate) / 8.0;
-            let secs = (st.ts.gop + START_BURST_S + 1.5).max(8.0);
-            let want = (bps * secs).clamp(1.5 * 1024.0 * 1024.0, 24.0 * 1024.0 * 1024.0) as usize;
-            let rcap = st.ts.rcap();
-            if rcap > 0 && (want as f64 > rcap as f64 * 1.25 || (want as f64) < rcap as f64 * 0.6) {
+        let bps = st.bitrate.max(st.ts.pcr_bitrate) / 8.0;
+        let secs = (st.ts.gop + START_BURST_S + 1.5).max(8.0);
+        let want = (bps * secs).clamp(1.5 * 1024.0 * 1024.0, 32.0 * 1024.0 * 1024.0) as usize;
+        let rcap = st.ts.rcap();
+        if rcap > 0 {
+            if want as f64 > rcap as f64 * 1.25 {
+                // Grow immediately (e.g. UHD 20-40 Mbps) — never wait 5s and overflow the initial ring
                 st.ts.ring_resize(want);
+                st.next_resize = now_s + 10.0;
+            } else if now_s >= st.next_resize {
+                st.next_resize = now_s + 10.0;
+                if (want as f64) < rcap as f64 * 0.6 {
+                    st.ts.ring_resize(want);
+                }
             }
         }
 
@@ -640,6 +673,12 @@ fn hls_out_feed(
         if !st.cur_started {
             run = hit.offset;
             seg_begin(st, hit.pcr, now_s);
+            if hit.back_bytes > 0 && hit.back_bytes <= 16 * TS && hit.offset == 0 {
+                let mut tmp = Vec::with_capacity(hit.back_bytes);
+                st.ts
+                    .ring_copy_into(&mut tmp, hit.pos, hit.pos + hit.back_bytes as u64);
+                st.cseg.extend_from_slice(&tmp);
+            }
             continue;
         }
         let d = seg_elapsed(st, hit.pcr, now_s);
@@ -653,14 +692,30 @@ fn hls_out_feed(
             seg_target * 0.72
         };
         if d >= target {
-            if hit.offset > run {
-                st.cseg.extend_from_slice(&pkts[run..hit.offset]);
+            if hit.back_bytes > 0
+                && hit.offset == 0
+                && run == 0
+                && hit.back_bytes <= 16 * TS
+                && st.cseg.len() >= hit.back_bytes
+            {
+                // Cross-chunk PUSI=1 lookahead: move the PUSI=1 + continuation packets cleanly to the new segment
+                let split_at = st.cseg.len() - hit.back_bytes;
+                let tail = st.cseg.split_off(split_at);
+                if seg_finish(st, seg_target, seg_keep, now_s, d) {
+                    finished_any = true;
+                }
+                seg_begin(st, hit.pcr, now_s);
+                st.cseg.extend_from_slice(&tail);
+            } else {
+                if hit.offset > run {
+                    st.cseg.extend_from_slice(&pkts[run..hit.offset]);
+                }
+                if seg_finish(st, seg_target, seg_keep, now_s, d) {
+                    finished_any = true;
+                }
+                run = hit.offset.max(run);
+                seg_begin(st, hit.pcr, now_s);
             }
-            if seg_finish(st, seg_target, seg_keep, now_s, d) {
-                finished_any = true;
-            }
-            run = hit.offset;
-            seg_begin(st, hit.pcr, now_s);
         }
     }
     if !st.cur_started {
@@ -670,7 +725,9 @@ fn hls_out_feed(
         st.cseg.extend_from_slice(&pkts[run..]);
     }
     let d = seg_elapsed(st, st.ts.cur_pcr, now_s);
-    if d >= seg_target * 3.0 || st.cseg.len() > 48 * 1024 * 1024 {
+    // Avoid force-cutting 4s-10s single-GOP UHD segments mid-GOP; only force-cut audio-only / broken streams
+    let force_cut = (seg_target * 4.0).max(12.0);
+    if d >= force_cut || st.cseg.len() > 64 * 1024 * 1024 {
         if seg_finish(st, seg_target, seg_keep, now_s, d) {
             finished_any = true;
         }
@@ -1491,6 +1548,26 @@ async fn run_hls_input(
                             }
                         }
 
+                        // Pre-refill inflight BEFORE pacing so the next 2 UHD segments download concurrently!
+                        let refill_cap = if burst_done { 2 } else { 3 };
+                        while inflight.len() < refill_cap {
+                            let Some(next_seg) = queue.pop_front() else {
+                                break;
+                            };
+                            let timeout = Duration::from_secs_f64((td * 1.5 + 3.0).clamp(6.0, 24.0));
+                            let c = ch.http_client.clone();
+                            let kc = ch.key_cache.clone();
+                            let u = ua.to_string();
+                            let seg_clone = next_seg.clone();
+                            let handle = tokio::spawn(async move {
+                                fetch_segment_task(c, kc, seg_clone, u, timeout).await
+                            });
+                            inflight.push_back(PendingSeg {
+                                seg: next_seg,
+                                handle,
+                            });
+                        }
+
                         // Feed segment: burst immediately until 2 output segments exist, then pace smoothly
                         if !burst_done {
                             ch.feed_ts(&payload, true);
@@ -1510,6 +1587,125 @@ async fn run_hls_input(
                                 ch.feed_ts(&payload[off..end], true);
                                 off = end;
                                 if off < payload.len() {
+                                    // Poll playlist mid-pacing if queue is running low so UHD segments never stall!
+                                    if Instant::now() >= next_poll
+                                        && queue.len() < 3
+                                        && inflight.len() < 2
+                                    {
+                                        let mut hdrs = HeaderMap::new();
+                                        if let Ok(v) = HeaderValue::from_str(ua) {
+                                            hdrs.insert(USER_AGENT, v);
+                                        }
+                                        if let Some(ref e) = etag {
+                                            if let Ok(v) = HeaderValue::from_str(e) {
+                                                hdrs.insert(IF_NONE_MATCH, v);
+                                            }
+                                        }
+                                        if let Some(ref lm) = last_mod {
+                                            if let Ok(v) = HeaderValue::from_str(lm) {
+                                                hdrs.insert(IF_MODIFIED_SINCE, v);
+                                            }
+                                        }
+                                        if let Ok(Ok(resp)) = tokio::time::timeout(
+                                            Duration::from_secs(3),
+                                            ch.http_client.get(&pl_url).headers(hdrs).send(),
+                                        )
+                                        .await
+                                        {
+                                            let st_c = resp.status().as_u16();
+                                            if st_c == 304 {
+                                                pl_err = 0;
+                                                next_poll = Instant::now()
+                                                    + Duration::from_secs_f64(
+                                                        (td * 0.25).clamp(0.4, 1.2),
+                                                    );
+                                            } else if st_c == 200 {
+                                                if let Some(e) = resp
+                                                    .headers()
+                                                    .get(ETAG)
+                                                    .and_then(|v| v.to_str().ok())
+                                                {
+                                                    etag = Some(e.to_string());
+                                                }
+                                                if let Some(lm) = resp
+                                                    .headers()
+                                                    .get(LAST_MODIFIED)
+                                                    .and_then(|v| v.to_str().ok())
+                                                {
+                                                    last_mod = Some(lm.to_string());
+                                                }
+                                                let final_u = resp.url().to_string();
+                                                if let Ok(text) = resp.text().await {
+                                                    if let Ok(ParsedPlaylist::Media {
+                                                        target_duration,
+                                                        has_media_sequence,
+                                                        segments,
+                                                        ..
+                                                    }) = parse_m3u8(&text, &final_u)
+                                                    {
+                                                        if target_duration > 0.0 {
+                                                            td = target_duration;
+                                                        }
+                                                        let mut added_mid = 0usize;
+                                                        for s in segments {
+                                                            let dk = seg_dedup_key(&s.url);
+                                                            let is_new = if has_media_sequence {
+                                                                s.seq > last_seq
+                                                            } else {
+                                                                !seen.contains(dk)
+                                                            };
+                                                            if is_new && queue.len() < 24 {
+                                                                seen.insert(dk);
+                                                                if s.seq > last_seq {
+                                                                    last_seq = s.seq;
+                                                                }
+                                                                queue.push_back(s);
+                                                                added_mid += 1;
+                                                            }
+                                                        }
+                                                        pl_err = 0;
+                                                        let td2 = if td > 0.0 { td } else { 6.0 };
+                                                        let wait_s = if added_mid > 0 {
+                                                            (td2 * 0.42).clamp(0.3, 1.8)
+                                                        } else {
+                                                            (td2 * 0.22).clamp(0.4, 1.1)
+                                                        };
+                                                        next_poll = Instant::now()
+                                                            + Duration::from_secs_f64(wait_s);
+                                                        while inflight.len() < 2 {
+                                                            let Some(ns) = queue.pop_front() else {
+                                                                break;
+                                                            };
+                                                            let timeout = Duration::from_secs_f64(
+                                                                (td * 1.5 + 3.0).clamp(6.0, 24.0),
+                                                            );
+                                                            let c = ch.http_client.clone();
+                                                            let kc = ch.key_cache.clone();
+                                                            let u = ua.to_string();
+                                                            let sc = ns.clone();
+                                                            let h = tokio::spawn(async move {
+                                                                fetch_segment_task(
+                                                                    c, kc, sc, u, timeout,
+                                                                )
+                                                                .await
+                                                            });
+                                                            inflight.push_back(PendingSeg {
+                                                                seg: ns,
+                                                                handle: h,
+                                                            });
+                                                        }
+                                                    }
+                                                }
+                                            } else {
+                                                next_poll = Instant::now()
+                                                    + Duration::from_millis(500);
+                                            }
+                                        } else {
+                                            next_poll =
+                                                Instant::now() + Duration::from_millis(500);
+                                        }
+                                        continue;
+                                    }
                                     let sleep_ms = if queue.len() >= 2 { 35 } else { 48 };
                                     tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
                                 }
@@ -1619,5 +1815,64 @@ mod tests {
         assert_eq!(st.mode, InputMode::Idle);
         assert_eq!(st.ts.rcap(), 0);
         assert_eq!(st.segs.len(), 0);
+    }
+
+    #[test]
+    fn uhd_large_segment_grows_ring_immediately_and_keeps_stable_targetduration() {
+        let client = Client::new();
+        let ch = Channel::new(
+            "uhd1".into(),
+            "UHD Test".into(),
+            vec!["http://127.0.0.1:9999/uhd.ts".into()],
+            vec![],
+            2.0,
+            5,
+            false,
+            20.0,
+            false,
+            String::new(),
+            String::new(),
+            None,
+            client,
+            AesKeyCache::new(),
+            Instant::now(),
+        );
+        {
+            let mut st = ch.inner.lock();
+            st.ts.alloc_ring(TS * 22310); // ~4.19 MB initial ring
+            st.mode = InputMode::Hls;
+            st.hls_on = true;
+            st.in_started = ch.now_s();
+            st.segs.push_back(OutSeg {
+                seq: 0,
+                dur: 1.0,
+                disc: false,
+                data: Arc::new(Bytes::from_static(b"ts")),
+            });
+        }
+
+        // Feed a 5 MB UHD HLS segment (3x = 15 MB > 4.19 MB initial ring)
+        let mut big = vec![0u8; TS * 28000];
+        for i in 0..28000 {
+            big[i * TS] = 0x47;
+            big[i * TS + 1] = 0x1F;
+            big[i * TS + 2] = 0xFF;
+            big[i * TS + 3] = 0x10;
+        }
+        ch.feed_ts(&big, true);
+
+        let rcap_after = ch.inner.lock().ts.rcap();
+        assert!(
+            rcap_after >= 14 * 1024 * 1024,
+            "expected immediate UHD ring growth >= 14 MB, got {}",
+            rcap_after
+        );
+
+        let (pl, _) = ch.render_hls_playlist("/play/uhd1/segment/", "").unwrap();
+        assert!(
+            pl.contains("#EXT-X-TARGETDURATION:2\n"),
+            "TARGETDURATION should stay >= 2s, got:\n{}",
+            pl
+        );
     }
 }

@@ -38,8 +38,9 @@ export function buildUbuntuMigrateCommand(opts: UbuntuMigrateOptions): string {
   const binRootUrl = `https://raw.githubusercontent.com/${owner}/${repo}/main/astrika`;
 
   const downloadStep = [
-    `  (curl -fLo /usr/bin/astrika "${binSubUrl}" || curl -fLo /usr/bin/astrika "${binRootUrl}")`,
-    '  chmod +x /usr/bin/astrika',
+    `  (curl -fLo /usr/bin/astrika.new "${binSubUrl}" || curl -fLo /usr/bin/astrika.new "${binRootUrl}")`,
+    '  chmod +x /usr/bin/astrika.new',
+    '  mv -f /usr/bin/astrika.new /usr/bin/astrika',
     `  astrika init ${port} --start`,
     '  systemctl --no-pager status astrika',
   ];

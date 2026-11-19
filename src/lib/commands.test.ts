@@ -44,6 +44,8 @@ test('preserveConfig Ubuntu command copies astrag.conf before removing astrag', 
   assert.ok(copyIdx > 0, 'must copy astrag.conf first');
   assert.ok(rmIdx > copyIdx, 'must remove /etc/astrag only after copying');
   assert.ok(dlIdx > rmIdx, 'must download astrika binary after removing astrag');
+  assert.ok(cmd.includes('curl -fLo /usr/bin/astrika.new'), 'must download to temp file to avoid ETXTBSY');
+  assert.ok(cmd.includes('mv -f /usr/bin/astrika.new /usr/bin/astrika'), 'must atomically replace running binary');
   assert.ok(cmd.includes('astrika init 8080 --start'));
 });
 

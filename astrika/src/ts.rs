@@ -97,6 +97,8 @@ pub struct KfEntry {
 #[derive(Clone, Copy, Debug)]
 pub struct KeyframeHit {
     pub offset: usize,
+    pub back_bytes: usize,
+    pub pos: u64,
     pub pcr: i64,
 }
 
@@ -176,8 +178,13 @@ pub struct TsEngine {
     pub out_cc: [i8; 8192],
     pub kind: [u8; 8192],
     pub stype: [u8; 8192],
-    // Multi-packet PES lookahead for keyframes when AUD/SEI pushes SPS/IDR to 2nd TS packet
-    pes_lookahead: [u8; 8192],
+    // Compact multi-packet PES lookahead for UHD/HEVC keyframes (AUD + HDR SEI up to 6 TS packets)
+    vid_la_pid: u16,
+    vid_la_rem: u8,
+    vid_la_pos: u64,
+    vid_la_pcr: i64,
+    vid_la_tail: [u8; 3],
+    vid_la_tail_len: u8,
 
     // PSI
     pub caps: Vec<PsiCap>,
@@ -229,7 +236,12 @@ impl TsEngine {
             out_cc: [-1; 8192],
             kind: [0; 8192],
             stype: [0; 8192],
-            pes_lookahead: [0; 8192],
+            vid_la_pid: 0xFFFF,
+            vid_la_rem: 0,
+            vid_la_pos: 0,
+            vid_la_pcr: -1,
+            vid_la_tail: [0; 3],
+            vid_la_tail_len: 0,
             caps: Vec::with_capacity(4),
             pmt_pid: [0; 8],
             pnr: [0; 8],
@@ -276,7 +288,9 @@ impl TsEngine {
         self.kind.fill(0);
         self.stype.fill(0);
         self.in_cc.fill(-1);
-        self.pes_lookahead.fill(0);
+        self.vid_la_pid = 0xFFFF;
+        self.vid_la_rem = 0;
+        self.vid_la_tail_len = 0;
         self.caps.clear();
         self.npmt = 0;
         self.pcr_pid = -1;
@@ -671,14 +685,27 @@ impl TsEngine {
     }
 
     /// Process a single 188-byte TS packet in place. Returns `(keep_packet, is_keyframe)`.
+    #[allow(dead_code)]
     pub fn process_packet(&mut self, p: &mut [u8; TS], hls: bool) -> (bool, bool) {
+        let (keep, kf) = self.process_packet_at(p, hls, self.wpos);
+        (keep, kf.is_some())
+    }
+
+    /// Process a single 188-byte TS packet at stream position `pkt_wpos`.
+    /// Returns `(keep_packet, Option<(kf_pusi_wpos, kf_pcr)>)`.
+    pub fn process_packet_at(
+        &mut self,
+        p: &mut [u8; TS],
+        hls: bool,
+        pkt_wpos: u64,
+    ) -> (bool, Option<(u64, i64)>) {
         let pid = (((p[1] & 0x1F) as usize) << 8) | p[2] as usize;
         if (pid == 0x11 && self.drop_sdt) || (pid == 0x12 && self.drop_eit) {
-            return (false, false);
+            return (false, None);
         }
         self.packets += 1;
         if pid == 0x1FFF {
-            return (true, false);
+            return (true, None);
         }
 
         let tei = (p[1] & 0x80) != 0;
@@ -723,7 +750,7 @@ impl TsEngine {
 
         if tei {
             self.in_cc[pid] = -1;
-            return (true, false);
+            return (true, None);
         }
 
         if (afc & 1) != 0 {
@@ -772,45 +799,85 @@ impl TsEngine {
             }
         }
 
-        let mut is_kf = false;
+        let mut kf_hit: Option<(u64, i64)> = None;
         if kind == K_VIDEO && !scr && (afc & 1) != 0 {
             let st = self.stype[pid];
+            let pid16 = pid as u16;
             if pusi {
-                self.pes_lookahead[pid] = 0;
+                if self.vid_la_pid == pid16 {
+                    self.vid_la_rem = 0;
+                    self.vid_la_tail_len = 0;
+                }
                 match pes_check_kf(p, off, st) {
-                    Some(true) => is_kf = true,
+                    Some(true) => kf_hit = Some((pkt_wpos, self.cur_pcr)),
                     Some(false) => {
                         if rai && st == 0 {
-                            is_kf = true;
+                            kf_hit = Some((pkt_wpos, self.cur_pcr));
                         }
                     }
                     None => {
                         if rai {
-                            is_kf = true;
+                            kf_hit = Some((pkt_wpos, self.cur_pcr));
                         } else {
-                            // Check next TS packet of this PES for SPS/IDR
-                            self.pes_lookahead[pid] = 2;
+                            // Look ahead up to 6 TS packets (covers UHD AUD + HDR10/HLG SEI before VPS/SPS/IDR)
+                            self.vid_la_pid = pid16;
+                            self.vid_la_rem = 6;
+                            self.vid_la_pos = pkt_wpos;
+                            self.vid_la_pcr = self.cur_pcr;
+                            let start = if off + 9 <= TS
+                                && p[off] == 0
+                                && p[off + 1] == 0
+                                && p[off + 2] == 1
+                            {
+                                (off + 9 + p[off + 8] as usize).min(TS)
+                            } else {
+                                TS
+                            };
+                            let tlen = (TS - start).min(3);
+                            if tlen > 0 {
+                                self.vid_la_tail[..tlen].copy_from_slice(&p[TS - tlen..TS]);
+                            }
+                            self.vid_la_tail_len = tlen as u8;
                         }
                     }
                 }
-            } else if self.pes_lookahead[pid] > 0 {
-                self.pes_lookahead[pid] -= 1;
+            } else if self.vid_la_rem > 0 && self.vid_la_pid == pid16 {
+                self.vid_la_rem -= 1;
                 if off < TS {
-                    match scan_video_nal(&p[off..TS], st) {
+                    let payload = &p[off..TS];
+                    let mut found: Option<bool> = None;
+                    let tlen = self.vid_la_tail_len as usize;
+                    if tlen > 0 {
+                        let mut bridge = [0u8; 6];
+                        let hlen = payload.len().min(3);
+                        bridge[..tlen].copy_from_slice(&self.vid_la_tail[..tlen]);
+                        bridge[tlen..tlen + hlen].copy_from_slice(&payload[..hlen]);
+                        found = scan_video_nal(&bridge[..tlen + hlen], st);
+                    }
+                    if found.is_none() {
+                        found = scan_video_nal(payload, st);
+                    }
+                    match found {
                         Some(true) => {
-                            is_kf = true;
-                            self.pes_lookahead[pid] = 0;
+                            kf_hit = Some((self.vid_la_pos, self.vid_la_pcr));
+                            self.vid_la_rem = 0;
+                            self.vid_la_tail_len = 0;
                         }
                         Some(false) => {
-                            self.pes_lookahead[pid] = 0;
+                            self.vid_la_rem = 0;
+                            self.vid_la_tail_len = 0;
                         }
-                        None => {}
+                        None => {
+                            let nt = payload.len().min(3);
+                            self.vid_la_tail[..nt].copy_from_slice(&payload[payload.len() - nt..]);
+                            self.vid_la_tail_len = nt as u8;
+                        }
                     }
                 }
             }
         }
 
-        (true, is_kf)
+        (true, kf_hit)
     }
 
     /// Feed raw MPEG-TS bytes directly into the ring buffer, returning:
@@ -838,16 +905,24 @@ impl TsEngine {
         // Helper closure-style macro for committing one packet into ring + out_packets
         macro_rules! commit_pkt {
             ($pkt:expr) => {{
-                let (keep, kf) = self.process_packet($pkt, hls_in);
+                let cur_pos = base_wpos + produced as u64;
+                let (keep, kf) = self.process_packet_at($pkt, hls_in, cur_pos);
                 if keep {
-                    if kf {
+                    if let Some((kf_pos, kf_pcr)) = kf {
+                        let (offset, back_bytes) = if kf_pos >= base_wpos {
+                            ((kf_pos - base_wpos) as usize, 0)
+                        } else {
+                            (0, (base_wpos - kf_pos) as usize)
+                        };
                         kfs.push(KeyframeHit {
-                            offset: produced,
-                            pcr: self.cur_pcr,
+                            offset,
+                            back_bytes,
+                            pos: kf_pos,
+                            pcr: kf_pcr,
                         });
                     }
                     // Write directly into circular ring
-                    let ro = ((base_wpos + produced as u64) % rcap as u64) as usize;
+                    let ro = (cur_pos % rcap as u64) as usize;
                     if ro + TS <= rcap {
                         self.ring[ro..ro + TS].copy_from_slice($pkt);
                     } else {
@@ -870,7 +945,7 @@ impl TsEngine {
                     self.synced = false;
                     // Fall back to resync loop from `i`
                     let rem_slice = &data[i..];
-                    produced += self.feed_slow(rem_slice, hls_in, base_wpos + produced as u64, produced, out_packets, kfs);
+                    produced += self.feed_slow(rem_slice, hls_in, base_wpos, base_wpos + produced as u64, out_packets, kfs);
                     self.finalize_feed(base_wpos, produced, now_s, kfs);
                     return produced;
                 }
@@ -893,7 +968,7 @@ impl TsEngine {
         combined.extend_from_slice(&self.carry[..self.carry_n]);
         combined.extend_from_slice(data);
         self.carry_n = 0;
-        produced += self.feed_slow(&combined, hls_in, base_wpos, 0, out_packets, kfs);
+        produced += self.feed_slow(&combined, hls_in, base_wpos, base_wpos, out_packets, kfs);
         self.finalize_feed(base_wpos, produced, now_s, kfs);
         produced
     }
@@ -902,8 +977,8 @@ impl TsEngine {
         &mut self,
         s: &[u8],
         hls_in: bool,
+        base_wpos: u64,
         mut wpos: u64,
-        mut produced_base: usize,
         out_packets: &mut Vec<u8>,
         kfs: &mut Vec<KeyframeHit>,
     ) -> usize {
@@ -923,12 +998,19 @@ impl TsEngine {
             self.synced = true;
             let mut pkt = [0u8; TS];
             pkt.copy_from_slice(&s[i..i + TS]);
-            let (keep, kf) = self.process_packet(&mut pkt, hls_in);
+            let (keep, kf) = self.process_packet_at(&mut pkt, hls_in, wpos);
             if keep {
-                if kf {
+                if let Some((kf_pos, kf_pcr)) = kf {
+                    let (offset, back_bytes) = if kf_pos >= base_wpos {
+                        ((kf_pos - base_wpos) as usize, 0)
+                    } else {
+                        (0, (base_wpos - kf_pos) as usize)
+                    };
                     kfs.push(KeyframeHit {
-                        offset: produced_base,
-                        pcr: self.cur_pcr,
+                        offset,
+                        back_bytes,
+                        pos: kf_pos,
+                        pcr: kf_pcr,
                     });
                 }
                 let ro = (wpos % rcap as u64) as usize;
@@ -941,7 +1023,6 @@ impl TsEngine {
                 }
                 out_packets.extend_from_slice(&pkt);
                 wpos += TS as u64;
-                produced_base += TS;
                 added += TS;
             }
             i += TS;
@@ -977,7 +1058,7 @@ impl TsEngine {
                 }
             }
             self.kf[self.kf_head] = KfEntry {
-                pos: base_wpos + hit.offset as u64,
+                pos: hit.pos,
                 pcr: hit.pcr,
                 wall: now_s,
             };
@@ -1163,5 +1244,68 @@ mod tests {
         let tail = ts.ring_read_chunk(ts.wpos - TS as u64, TS);
         assert_eq!(tail.len(), TS);
         assert_eq!(tail[4], 79);
+    }
+
+    #[test]
+    fn detects_hevc_uhd_keyframe_across_hdr_sei_and_split_startcode_at_pusi_offset() {
+        let mut ts = TsEngine::new();
+        ts.alloc_ring(TS * 128);
+        ts.kind[0x101] = K_VIDEO;
+        ts.stype[0x101] = 0x24; // HEVC
+
+        // Packet 0: PUSI=1 + PES header + AUD + start of HDR10 PREFIX_SEI
+        let mut p1 = [0xAAu8; TS];
+        p1[0] = 0x47;
+        p1[1] = 0x41; // PUSI=1, PID=0x101
+        p1[2] = 0x01;
+        p1[3] = 0x10;
+        p1[4] = 0x00;
+        p1[5] = 0x00;
+        p1[6] = 0x01;
+        p1[7] = 0xE0;
+        p1[12] = 0; // PES header data len
+        p1[13] = 0x00;
+        p1[14] = 0x00;
+        p1[15] = 0x01;
+        p1[16] = 35 << 1; // HEVC AUD_NUT
+        p1[17] = 0x01;
+        p1[18] = 0x00;
+        p1[19] = 0x00;
+        p1[20] = 0x01;
+        p1[21] = 39 << 1; // HEVC PREFIX_SEI_NUT (non-conclusive HDR metadata)
+
+        // Packet 1: continuation of HDR10 SEI, ending with split 0x00 0x00 start code
+        let mut p2 = [0xBBu8; TS];
+        p2[0] = 0x47;
+        p2[1] = 0x01; // PUSI=0
+        p2[2] = 0x01;
+        p2[3] = 0x11;
+        p2[TS - 2] = 0x00;
+        p2[TS - 1] = 0x00;
+
+        // Packet 2: starts with 0x01 + HEVC VPS_NUT (32 << 1 = 0x40)
+        let mut p3 = [0xCCu8; TS];
+        p3[0] = 0x47;
+        p3[1] = 0x01; // PUSI=0
+        p3[2] = 0x01;
+        p3[3] = 0x12;
+        p3[4] = 0x01;
+        p3[5] = 32 << 1; // HEVC VPS_NUT
+
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&p1);
+        buf.extend_from_slice(&p2);
+        buf.extend_from_slice(&p3);
+
+        let mut out = Vec::new();
+        let mut kfs = Vec::new();
+        ts.feed(&buf, false, 1.0, &mut out, &mut kfs);
+
+        assert_eq!(kfs.len(), 1);
+        // Keyframe MUST point back to Packet 0 (PUSI=1, offset 0), NOT Packet 2!
+        assert_eq!(kfs[0].offset, 0);
+        assert_eq!(kfs[0].back_bytes, 0);
+        assert_eq!(kfs[0].pos, 0);
+        assert_eq!(ts.kf[0].pos, 0);
     }
 }

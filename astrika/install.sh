@@ -86,12 +86,22 @@ if [ -n "${BASH_SOURCE[0]:-}" ] && [ -f "${BASH_SOURCE[0]}" ]; then
 fi
 
 TMP_DIR=""
+STAGING_BIN="/usr/bin/.astrika.new.$$"
 cleanup_tmp() {
+    rm -f "$STAGING_BIN" 2>/dev/null || true
     if [ -n "$TMP_DIR" ] && [ -d "$TMP_DIR" ]; then
         rm -rf "$TMP_DIR"
     fi
 }
 trap cleanup_tmp EXIT
+
+install_atomic() {
+    local src="$1"
+    cp -f "$src" "$STAGING_BIN"
+    chown root:root "$STAGING_BIN" 2>/dev/null || true
+    chmod 0755 "$STAGING_BIN"
+    mv -f "$STAGING_BIN" /usr/bin/astrika
+}
 
 build_from_source() {
     local src_dir="$1"
@@ -105,10 +115,10 @@ build_from_source() {
         apt-get update -qq || true
         DEBIAN_FRONTEND=noninteractive apt-get install -y -qq musl-tools ca-certificates || true
         "$src_dir/build-static.sh"
-        install -o root -g root -m 0755 "$src_dir/astrika" /usr/bin/astrika
+        install_atomic "$src_dir/astrika"
     else
         (cd "$src_dir" && cargo build --release)
-        install -o root -g root -m 0755 "$src_dir/target/release/astrika" /usr/bin/astrika
+        install_atomic "$src_dir/target/release/astrika"
     fi
 }
 
@@ -118,23 +128,26 @@ INSTALLED_BIN=false
 if ! "$FORCE_BUILD" && [ "$ARCH" = "x86_64" ]; then
     if [ -n "$SCRIPT_DIR" ] && [ -f "$SCRIPT_DIR/astrika" ] && "$SCRIPT_DIR/astrika" --version >/dev/null 2>&1; then
         echo "==> Installing local static Rust binary (/usr/bin/astrika)..."
-        install -o root -g root -m 0755 "$SCRIPT_DIR/astrika" /usr/bin/astrika
+        install_atomic "$SCRIPT_DIR/astrika"
         INSTALLED_BIN=true
     fi
 
     if ! "$INSTALLED_BIN"; then
-        TMP_DIR="$(mktemp -d /tmp/astrika-inst.XXXXXX)"
         if ! command -v curl >/dev/null 2>&1; then
             apt-get update -qq
             DEBIAN_FRONTEND=noninteractive apt-get install -y -qq curl ca-certificates
         fi
         echo "==> Downloading static Rust binary astrika from GitHub..."
-        if curl -fsSL "$RAW_URL" -o "$TMP_DIR/astrika" && chmod 0755 "$TMP_DIR/astrika" && "$TMP_DIR/astrika" --version >/dev/null 2>&1; then
-            install -o root -g root -m 0755 "$TMP_DIR/astrika" /usr/bin/astrika
+        if curl -fsSL "$RAW_URL" -o "$STAGING_BIN" && chmod 0755 "$STAGING_BIN" && "$STAGING_BIN" --version >/dev/null 2>&1; then
+            chown root:root "$STAGING_BIN" 2>/dev/null || true
+            mv -f "$STAGING_BIN" /usr/bin/astrika
             INSTALLED_BIN=true
-        elif curl -fsSL "$RAW_URL_ALT" -o "$TMP_DIR/astrika" && chmod 0755 "$TMP_DIR/astrika" && "$TMP_DIR/astrika" --version >/dev/null 2>&1; then
-            install -o root -g root -m 0755 "$TMP_DIR/astrika" /usr/bin/astrika
+        elif rm -f "$STAGING_BIN" && curl -fsSL "$RAW_URL_ALT" -o "$STAGING_BIN" && chmod 0755 "$STAGING_BIN" && "$STAGING_BIN" --version >/dev/null 2>&1; then
+            chown root:root "$STAGING_BIN" 2>/dev/null || true
+            mv -f "$STAGING_BIN" /usr/bin/astrika
             INSTALLED_BIN=true
+        else
+            rm -f "$STAGING_BIN"
         fi
     fi
 fi
