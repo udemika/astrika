@@ -152,6 +152,43 @@ pub fn scan_video_nal(buf: &[u8], stype: u8) -> Option<bool> {
     None
 }
 
+/// Keyframe-only NAL scanner for multi-AU-per-PES streams (e.g. Flussonic HEVC 4K where
+/// keyframes start inside PUSI=0 packets after the tail of a preceding P/B slice).
+/// Annex-B emulation prevention guarantees `00 00 01` cannot occur inside slice payload bytes.
+#[inline]
+pub fn scan_video_nal_kf_only(buf: &[u8], stype: u8) -> bool {
+    let mut i = 0usize;
+    let len = buf.len();
+    while i + 4 <= len {
+        let Some(rel) = memchr(0x00, &buf[i..len - 3]) else {
+            return false;
+        };
+        i += rel;
+        if buf[i + 1] == 0x00 && buf[i + 2] == 0x01 {
+            let b = buf[i + 3];
+            if stype == 0x24 {
+                let t = (b >> 1) & 0x3F;
+                if (16..=21).contains(&t) || t == 32 || t == 33 {
+                    return true;
+                }
+            } else if stype == 0x01 || stype == 0x02 {
+                if b == 0xB3 {
+                    return true;
+                }
+            } else {
+                let t = b & 0x1F;
+                if t == 7 || t == 5 {
+                    return true;
+                }
+            }
+            i += 3;
+        } else {
+            i += 1;
+        }
+    }
+    false
+}
+
 #[inline]
 fn pes_check_kf(pkt: &[u8; TS], off: usize, stype: u8) -> Option<bool> {
     if off + 9 > TS || pkt[off] != 0 || pkt[off + 1] != 0 || pkt[off + 2] != 1 {
@@ -185,6 +222,14 @@ pub struct TsEngine {
     vid_la_pcr: i64,
     vid_la_tail: [u8; 3],
     vid_la_tail_len: u8,
+    // Adaptive PUSI=0 fallback scanner (zero CPU on normal 1-AU-per-PES streams;
+    // activates only on multi-AU-per-PES streams like Flussonic HEVC 4K)
+    vid_pkts_since_kf: u32,
+    vid_fb_pid: u16,
+    vid_fb_tail: [u8; 3],
+    vid_fb_tail_len: u8,
+    multi_au_pes: bool,
+    pusi_kf_streak: u8,
 
     // PSI
     pub caps: Vec<PsiCap>,
@@ -242,6 +287,12 @@ impl TsEngine {
             vid_la_pcr: -1,
             vid_la_tail: [0; 3],
             vid_la_tail_len: 0,
+            vid_pkts_since_kf: 0,
+            vid_fb_pid: 0xFFFF,
+            vid_fb_tail: [0; 3],
+            vid_fb_tail_len: 0,
+            multi_au_pes: false,
+            pusi_kf_streak: 0,
             caps: Vec::with_capacity(4),
             pmt_pid: [0; 8],
             pnr: [0; 8],
@@ -291,6 +342,11 @@ impl TsEngine {
         self.vid_la_pid = 0xFFFF;
         self.vid_la_rem = 0;
         self.vid_la_tail_len = 0;
+        self.vid_pkts_since_kf = 0;
+        self.vid_fb_pid = 0xFFFF;
+        self.vid_fb_tail_len = 0;
+        self.multi_au_pes = false;
+        self.pusi_kf_streak = 0;
         self.caps.clear();
         self.npmt = 0;
         self.pcr_pid = -1;
@@ -803,10 +859,14 @@ impl TsEngine {
         if kind == K_VIDEO && !scr && (afc & 1) != 0 {
             let st = self.stype[pid];
             let pid16 = pid as u16;
+            self.vid_pkts_since_kf = self.vid_pkts_since_kf.saturating_add(1);
             if pusi {
                 if self.vid_la_pid == pid16 {
                     self.vid_la_rem = 0;
                     self.vid_la_tail_len = 0;
+                }
+                if self.vid_fb_pid == pid16 {
+                    self.vid_fb_tail_len = 0;
                 }
                 match pes_check_kf(p, off, st) {
                     Some(true) => kf_hit = Some((pkt_wpos, self.cur_pcr)),
@@ -841,6 +901,13 @@ impl TsEngine {
                         }
                     }
                 }
+                if kf_hit.is_some() {
+                    self.vid_pkts_since_kf = 0;
+                    self.pusi_kf_streak = self.pusi_kf_streak.saturating_add(1);
+                    if self.pusi_kf_streak >= 3 {
+                        self.multi_au_pes = false;
+                    }
+                }
             } else if self.vid_la_rem > 0 && self.vid_la_pid == pid16 {
                 self.vid_la_rem -= 1;
                 if off < TS {
@@ -862,6 +929,11 @@ impl TsEngine {
                             kf_hit = Some((self.vid_la_pos, self.vid_la_pcr));
                             self.vid_la_rem = 0;
                             self.vid_la_tail_len = 0;
+                            self.vid_pkts_since_kf = 0;
+                            self.pusi_kf_streak = self.pusi_kf_streak.saturating_add(1);
+                            if self.pusi_kf_streak >= 3 {
+                                self.multi_au_pes = false;
+                            }
                         }
                         Some(false) => {
                             self.vid_la_rem = 0;
@@ -874,6 +946,35 @@ impl TsEngine {
                         }
                     }
                 }
+            } else if (self.multi_au_pes || self.vid_pkts_since_kf >= 2500) && off < TS {
+                let payload = &p[off..TS];
+                if self.vid_fb_pid != pid16 {
+                    self.vid_fb_pid = pid16;
+                    self.vid_fb_tail_len = 0;
+                }
+                if self.vid_pkts_since_kf >= 32 {
+                    let mut found = false;
+                    let tlen = self.vid_fb_tail_len as usize;
+                    if tlen > 0 {
+                        let mut bridge = [0u8; 6];
+                        let hlen = payload.len().min(3);
+                        bridge[..tlen].copy_from_slice(&self.vid_fb_tail[..tlen]);
+                        bridge[tlen..tlen + hlen].copy_from_slice(&payload[..hlen]);
+                        found = scan_video_nal_kf_only(&bridge[..tlen + hlen], st);
+                    }
+                    if !found {
+                        found = scan_video_nal_kf_only(payload, st);
+                    }
+                    if found {
+                        kf_hit = Some((pkt_wpos, self.cur_pcr));
+                        self.vid_pkts_since_kf = 0;
+                        self.multi_au_pes = true;
+                        self.pusi_kf_streak = 0;
+                    }
+                }
+                let nt = payload.len().min(3);
+                self.vid_fb_tail[..nt].copy_from_slice(&payload[payload.len() - nt..]);
+                self.vid_fb_tail_len = nt as u8;
             }
         }
 
@@ -1307,5 +1408,57 @@ mod tests {
         assert_eq!(kfs[0].back_bytes, 0);
         assert_eq!(kfs[0].pos, 0);
         assert_eq!(ts.kf[0].pos, 0);
+    }
+
+    #[test]
+    fn detects_hevc_keyframe_inside_pusi0_multi_au_pes() {
+        let mut ts = TsEngine::new();
+        ts.alloc_ring(TS * 4096);
+        ts.kind[0xD3] = K_VIDEO;
+        ts.stype[0xD3] = 0x24; // HEVC
+
+        // Simulate 2500 PUSI=0 packets of P-frame slices (multi-AU-per-PES without PUSI=1 keyframes)
+        let mut filler = [0xAAu8; TS];
+        filler[0] = 0x47;
+        filler[1] = 0x00;
+        filler[2] = 0xD3;
+        filler[3] = 0x10;
+        let mut buf = Vec::with_capacity(TS * 2505);
+        for i in 0..2500usize {
+            filler[3] = 0x10 | (i as u8 & 0x0F);
+            buf.extend_from_slice(&filler);
+        }
+
+        // Packet 2500: PUSI=0 carrying AUD + HEVC VPS (00 00 01 40) mid-packet
+        let mut kvps = [0xAAu8; TS];
+        kvps[0] = 0x47;
+        kvps[1] = 0x00;
+        kvps[2] = 0xD3;
+        kvps[3] = 0x10 | (2500usize as u8 & 0x0F);
+        kvps[98] = 0x00;
+        kvps[99] = 0x00;
+        kvps[100] = 0x01;
+        kvps[101] = 32 << 1; // VPS_NUT = 32
+        buf.extend_from_slice(&kvps);
+
+        // Packet 2501: adjacent PUSI=0 carrying HEVC CRA (00 00 01 2A) — must be deduplicated by cooldown!
+        let mut kcra = [0xAAu8; TS];
+        kcra[0] = 0x47;
+        kcra[1] = 0x00;
+        kcra[2] = 0xD3;
+        kcra[3] = 0x10 | (2501usize as u8 & 0x0F);
+        kcra[50] = 0x00;
+        kcra[51] = 0x00;
+        kcra[52] = 0x01;
+        kcra[53] = 21 << 1; // CRA_NUT = 21
+        buf.extend_from_slice(&kcra);
+
+        let mut out = Vec::new();
+        let mut kfs = Vec::new();
+        ts.feed(&buf, false, 1.0, &mut out, &mut kfs);
+
+        assert_eq!(kfs.len(), 1, "expected exactly 1 deduplicated PUSI=0 keyframe");
+        assert_eq!(kfs[0].offset, 2500 * TS);
+        assert!(ts.multi_au_pes);
     }
 }

@@ -290,8 +290,8 @@ impl Channel {
         if st.mode != InputMode::Idle {
             return false;
         }
-        // Lean initial ring: ~1.0 MB for cluster channels, ~2.0 MB for direct sources (grows dynamically for UHD)
-        let init_ring = if self.is_cluster { TS * 5500 } else { TS * 11000 };
+        // Balanced initial ring: ~1.5 MB for cluster channels, ~3.0 MB for direct sources (grows dynamically for UHD)
+        let init_ring = if self.is_cluster { TS * 8192 } else { TS * 16000 };
         st.ts.alloc_ring(init_ring);
         st.ts.reset_out_cc();
         st.ts.reset_psi();
@@ -374,7 +374,7 @@ impl Channel {
 
             // Immediate UHD ring growth: prevent initial ring from wrapping on 15-40 Mbps UHD streams
             // or large UHD HLS segments before tick_1s() runs (zero RAM bloat for SD/HD or idle channels).
-            const MAX_RING: usize = 22 * 1024 * 1024;
+            const MAX_RING: usize = 24 * 1024 * 1024;
             let rcap = st.ts.rcap();
             if rcap < MAX_RING {
                 let need_for_chunk = data.len().saturating_mul(3);
@@ -387,7 +387,7 @@ impl Channel {
                         let projected_wpos = st.ts.wpos + data.len() as u64;
                         if projected_wpos > (rcap as u64 * 3 / 5) {
                             let est_bps = projected_wpos as f64 / elapsed;
-                            let want = ((est_bps * 6.0) as usize)
+                            let want = ((est_bps * 7.5) as usize)
                                 .max(rcap.saturating_mul(2))
                                 .min(MAX_RING);
                             if want > rcap {
@@ -569,23 +569,23 @@ impl Channel {
             if st.ts.pcr_bitrate > 0.0 {
                 st.ts.pcr_bitrate
             } else {
-                st.bitrate.min(18_000_000.0)
+                st.bitrate.min(20_000_000.0)
             }
         } else {
             st.bitrate.max(st.ts.pcr_bitrate)
         };
         let bps = eff_br / 8.0;
-        let secs = (st.ts.gop + 2.5 + 1.0).max(5.0);
-        let want = (bps * secs).clamp(1.0 * 1024.0 * 1024.0, 22.0 * 1024.0 * 1024.0) as usize;
+        let secs = (st.ts.gop.min(6.0) + 4.0).clamp(6.0, 10.0);
+        let want = (bps * secs).clamp(1.5 * 1024.0 * 1024.0, 24.0 * 1024.0 * 1024.0) as usize;
         let rcap = st.ts.rcap();
         if rcap > 0 {
             if want as f64 > rcap as f64 * 1.25 {
                 // Grow immediately (e.g. UHD 20-40 Mbps) — never wait and overflow the ring
                 st.ts.ring_resize(want);
-                st.next_resize = now_s + 10.0;
+                st.next_resize = now_s + 15.0;
             } else if now_s >= st.next_resize {
-                st.next_resize = now_s + 10.0;
-                if (want as f64) < rcap as f64 * 0.75 {
+                st.next_resize = now_s + 15.0;
+                if (want as f64) < rcap as f64 * 0.55 {
                     st.ts.ring_resize(want);
                 }
             }
@@ -642,7 +642,7 @@ fn seg_elapsed(st: &ChannelInner, pcr: i64, now_s: f64) -> f64 {
 
 fn seg_begin(st: &mut ChannelInner, pcr: i64, wall: f64) {
     if st.cseg.capacity() == 0 && st.last_seg_bytes > 0 {
-        let est = (st.last_seg_bytes + st.last_seg_bytes / 12).clamp(64 * 1024, 12 * 1024 * 1024);
+        let est = (st.last_seg_bytes + st.last_seg_bytes / 10).clamp(64 * 1024, 8 * 1024 * 1024);
         st.cseg = Vec::with_capacity(est);
     } else {
         st.cseg.clear();
@@ -662,9 +662,13 @@ fn seg_finish(st: &mut ChannelInner, seg_target: f64, seg_keep: usize, now_s: f6
     let seq = st.next_seq;
     st.next_seq += 1;
     let mut buf = std::mem::take(&mut st.cseg);
-    st.last_seg_bytes = buf.len();
-    // Eliminate geometric Vec over-allocation (e.g. 16 MB backing for a 9 MB UHD segment)
-    if buf.capacity() > buf.len().saturating_add(64 * 1024) {
+    st.last_seg_bytes = if st.last_seg_bytes == 0 {
+        buf.len()
+    } else {
+        (st.last_seg_bytes * 7 + buf.len() * 3) / 10
+    };
+    // Only shrink on heavy (>33%) geometric over-allocation so normal segments incur zero extra memcpy/CPU
+    if buf.capacity() > buf.len().saturating_add((buf.len() / 3).max(256 * 1024)) {
         buf.shrink_to_fit();
     }
     let seg = OutSeg {
@@ -673,8 +677,9 @@ fn seg_finish(st: &mut ChannelInner, seg_target: f64, seg_keep: usize, now_s: f6
         disc: st.cur_disc,
         data: Arc::new(Bytes::from(buf)),
     };
+    // When no HLS viewer is active (>60s idle), keep 2 ready segments for instant 0ms open while saving 1 UHD segment of RAM
     let keep = if now_s - st.hls_last_req > 60.0 {
-        3
+        2
     } else {
         seg_keep
     };
@@ -747,7 +752,12 @@ fn hls_out_feed(
         }
     }
     if !st.cur_started {
-        return finished_any;
+        if now_s - st.in_started >= 3.0 && st.ts.has_psi() {
+            let cur_pcr = st.ts.cur_pcr;
+            seg_begin(st, cur_pcr, now_s);
+        } else {
+            return finished_any;
+        }
     }
     if pkts.len() > run {
         st.cseg.extend_from_slice(&pkts[run..]);
@@ -1306,6 +1316,7 @@ async fn run_hls_input(
     let mut pl_err = 0usize;
     let mut consec_seg_err = 0usize;
     let mut burst_done = false;
+    let mut burst_dur = 0.0f64;
     let mut avg_bps = 0.0f64;
 
     let mut pending_initial = initial_body;
@@ -1514,13 +1525,13 @@ async fn run_hls_input(
             }
         }
 
-        // 2. Adaptive parallel segment prefetch (2 during cold burst for instant start, 1 steady-state for lean RAM)
-        let parallel_cap = if burst_done { 1 } else { 2 };
+        // 2. Adaptive parallel segment prefetch (3 during cold burst for instant start, 2 steady-state for rock-solid UHD)
+        let parallel_cap = if burst_done { 2 } else { 3 };
         while inflight.len() < parallel_cap {
             let Some(seg) = queue.pop_front() else {
                 break;
             };
-            let timeout = Duration::from_secs_f64((td * 1.5 + 2.0).clamp(5.0, 20.0));
+            let timeout = Duration::from_secs_f64((td * 1.5 + 3.0).clamp(6.0, 24.0));
             let c = ch.http_client.clone();
             let kc = ch.key_cache.clone();
             let u = ua.to_string();
@@ -1574,44 +1585,40 @@ async fn run_hls_input(
                             if seg_disc {
                                 st.disc_pending = true;
                             }
-                            // Pre-size ring smoothly from real segment bitrate (avoids 32 MB overshoot)
+                            // Pre-size ring smoothly from real segment bitrate (no overshoot, no UHD wrap)
                             if avg_bps > 0.0 {
-                                let want = ((avg_bps * 5.2) as usize)
-                                    .clamp(1024 * 1024, 22 * 1024 * 1024);
+                                let want = ((avg_bps * 6.5) as usize)
+                                    .clamp(1536 * 1024, 24 * 1024 * 1024);
                                 if want > st.ts.rcap().saturating_mul(5) / 4 {
                                     st.ts.ring_resize(want);
                                 }
                             }
                         }
 
-                        // During cold burst or short segments, pre-refill immediately; for long large segments
-                        // (>= 5s & >= 2 MB), defer prefetch until ~4.5s remain so two 15 MB segments aren't pinned simultaneously.
-                        let defer_prefetch =
-                            burst_done && seg_dur >= 5.0 && payload.len() >= 2 * 1024 * 1024;
-                        let refill_cap = if burst_done { 1 } else { 2 };
-                        if !defer_prefetch {
-                            while inflight.len() < refill_cap {
-                                let Some(next_seg) = queue.pop_front() else {
-                                    break;
-                                };
-                                let timeout =
-                                    Duration::from_secs_f64((td * 1.5 + 3.0).clamp(6.0, 24.0));
-                                let c = ch.http_client.clone();
-                                let kc = ch.key_cache.clone();
-                                let u = ua.to_string();
-                                let seg_clone = next_seg.clone();
-                                let handle = tokio::spawn(async move {
-                                    fetch_segment_task(c, kc, seg_clone, u, timeout).await
-                                });
-                                inflight.push_back(PendingSeg {
-                                    seg: next_seg,
-                                    handle,
-                                });
-                            }
+                        // Pre-refill inflight IMMEDIATELY before pacing so UHD segments always download ahead!
+                        let refill_cap = if burst_done { 2 } else { 3 };
+                        while inflight.len() < refill_cap {
+                            let Some(next_seg) = queue.pop_front() else {
+                                break;
+                            };
+                            let timeout =
+                                Duration::from_secs_f64((td * 1.5 + 3.0).clamp(6.0, 24.0));
+                            let c = ch.http_client.clone();
+                            let kc = ch.key_cache.clone();
+                            let u = ua.to_string();
+                            let seg_clone = next_seg.clone();
+                            let handle = tokio::spawn(async move {
+                                fetch_segment_task(c, kc, seg_clone, u, timeout).await
+                            });
+                            inflight.push_back(PendingSeg {
+                                seg: next_seg,
+                                handle,
+                            });
                         }
 
                         // Feed segment: burst immediately in 256 KB chunks (prevents 16 MB scratch_pkts bloat!)
-                        // until 2 output segments exist, then pace smoothly.
+                        // until 2 output segments exist OR >= 4.5s of media has been bursted (never drain
+                        // the entire live playlist window on long-GOP / 6s UHD segments!).
                         if !burst_done {
                             const BURST_CHUNK: usize = 1400 * TS;
                             let mut off = 0usize;
@@ -1620,8 +1627,9 @@ async fn run_hls_input(
                                 ch.feed_ts(&payload[off..end], true);
                                 off = end;
                             }
+                            burst_dur += if seg_dur > 0.2 { seg_dur } else { td.min(6.0) };
                             let nsegs = ch.inner.lock().segs.len();
-                            if nsegs >= 2 {
+                            if nsegs >= 2 || burst_dur >= 4.5 {
                                 burst_done = true;
                             }
                         } else {
@@ -1636,31 +1644,10 @@ async fn run_hls_input(
                                 ch.feed_ts(&payload[off..end], true);
                                 off = end;
                                 if off < payload.len() {
-                                    let rem_secs = (payload.len() - off) as f64 / bps;
-                                    // Launch the single deferred prefetch with >= 4.5s runway before segment ends
-                                    if inflight.is_empty() && (!defer_prefetch || rem_secs <= 4.5) {
-                                        if let Some(next_seg) = queue.pop_front() {
-                                            let timeout = Duration::from_secs_f64(
-                                                (td * 1.5 + 3.0).clamp(6.0, 24.0),
-                                            );
-                                            let c = ch.http_client.clone();
-                                            let kc = ch.key_cache.clone();
-                                            let u = ua.to_string();
-                                            let seg_clone = next_seg.clone();
-                                            let handle = tokio::spawn(async move {
-                                                fetch_segment_task(c, kc, seg_clone, u, timeout)
-                                                    .await
-                                            });
-                                            inflight.push_back(PendingSeg {
-                                                seg: next_seg,
-                                                handle,
-                                            });
-                                        }
-                                    }
-                                    // Poll playlist mid-pacing if queue is running low so UHD segments never stall!
+                                    // Poll playlist mid-pacing so queue & 2-slot inflight never starve on UHD!
                                     if Instant::now() >= next_poll
-                                        && queue.len() < 2
-                                        && inflight.is_empty()
+                                        && queue.len() < 3
+                                        && inflight.len() < 2
                                     {
                                         let mut hdrs = HeaderMap::new();
                                         if let Ok(v) = HeaderValue::from_str(ua) {
@@ -1742,7 +1729,7 @@ async fn run_hls_input(
                                                         };
                                                         next_poll = Instant::now()
                                                             + Duration::from_secs_f64(wait_s);
-                                                        while inflight.is_empty() && (!defer_prefetch || rem_secs <= 4.5) {
+                                                        while inflight.len() < 2 {
                                                             let Some(ns) = queue.pop_front() else {
                                                                 break;
                                                             };
@@ -1812,9 +1799,9 @@ async fn run_hls_input(
             }
         }
 
-        // Watchdog for stalled HLS stream
+        // Watchdog for stalled HLS stream (generous enough for 25-30 MB UHD segment spikes)
         let last_data_age = ch.now_s() - ch.inner.lock().last_data;
-        let max_idle = (td * 2.5).max(12.0);
+        let max_idle = (td * 3.5).max(18.0);
         if last_data_age > max_idle {
             for p in inflight {
                 p.handle.abort();
