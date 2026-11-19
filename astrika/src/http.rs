@@ -81,6 +81,8 @@ struct ClusterStream {
     orig_id: String,
     host_port: String,
     auth_header: Option<String>,
+    auth_query: Option<String>,
+    remote_hls_enabled: bool,
     cfg: Value,
 }
 
@@ -129,6 +131,7 @@ impl AppState {
         let http_client = Client::builder()
             .dns_resolver(dns)
             .danger_accept_invalid_certs(!verify_tls)
+            .connect_timeout(Duration::from_secs(6))
             .pool_max_idle_per_host(16)
             .pool_idle_timeout(Duration::from_secs(45))
             .tcp_nodelay(true)
@@ -993,26 +996,67 @@ async fn dispatch_media_tail(
     handle_media_play_ts(state, ctx, sid, host_hint).await
 }
 
-fn resolve_http_output(state: &AppState, path: &str, req_port: u16) -> Option<(String, u8, String)> {
-    let snap = state.config();
-    for route in &snap.http_outputs {
+fn strip_m3u8_output_suffix(path: &str) -> Option<&str> {
+    let lower = path.to_ascii_lowercase();
+    if lower.ends_with("/index.m3u8") {
+        let base = &path[..path.len() - "/index.m3u8".len()];
+        Some(base.trim_end_matches('/'))
+    } else if lower.ends_with(".m3u8") {
+        let base = &path[..path.len() - ".m3u8".len()];
+        Some(base.trim_end_matches('/'))
+    } else {
+        None
+    }
+}
+
+fn match_http_output_routes(
+    routes: &[crate::config::HttpOutputRoute],
+    path: &str,
+    req_port: u16,
+) -> Option<(String, u8, String)> {
+    for route in routes {
         if route.port != req_port {
             continue;
         }
-        let rp = route.path.trim_end_matches('/');
-        if path == route.path || path == rp {
-            return Some((route.stream_id.clone(), 0, String::new()));
-        }
-        if path == format!("{}.m3u8", rp) || path == format!("{}/index.m3u8", rp) {
-            return Some((route.stream_id.clone(), 1, String::new()));
-        }
-        if let Some(seg) = path.strip_prefix(&format!("{}/segment/", rp)) {
-            if !seg.is_empty() {
-                return Some((route.stream_id.clone(), 2, seg.to_string()));
+        if let Some(base_rp) = strip_m3u8_output_suffix(&route.path) {
+            if path == route.path
+                || (!base_rp.is_empty()
+                    && (path == format!("{}.m3u8", base_rp)
+                        || path == format!("{}/index.m3u8", base_rp)))
+            {
+                return Some((route.stream_id.clone(), 1, String::new()));
+            }
+            if !base_rp.is_empty() {
+                if let Some(seg) = path.strip_prefix(&format!("{}/segment/", base_rp)) {
+                    if !seg.is_empty() {
+                        return Some((route.stream_id.clone(), 2, seg.to_string()));
+                    }
+                }
+                if path == base_rp {
+                    return Some((route.stream_id.clone(), 0, String::new()));
+                }
+            }
+        } else {
+            let rp = route.path.trim_end_matches('/');
+            if path == route.path || path == rp {
+                return Some((route.stream_id.clone(), 0, String::new()));
+            }
+            if path == format!("{}.m3u8", rp) || path == format!("{}/index.m3u8", rp) {
+                return Some((route.stream_id.clone(), 1, String::new()));
+            }
+            if let Some(seg) = path.strip_prefix(&format!("{}/segment/", rp)) {
+                if !seg.is_empty() {
+                    return Some((route.stream_id.clone(), 2, seg.to_string()));
+                }
             }
         }
     }
     None
+}
+
+fn resolve_http_output(state: &AppState, path: &str, req_port: u16) -> Option<(String, u8, String)> {
+    let snap = state.config();
+    match_http_output_routes(&snap.http_outputs, path, req_port)
 }
 
 async fn handle_media_play_ts(
@@ -1246,8 +1290,10 @@ async fn handle_media_play_hls(
     // Eliminates double-buffering and 2-6s local re-segmentation delay (0 extra local RAM).
     let cluster_info = state.cluster_streams.read().get(&rsid).cloned();
     if let Some(cs) = cluster_info {
-        if let Some(resp) = proxy_cluster_hls_playlist(state, &cs, &rsid, ctx, &tqs).await {
-            return resp;
+        if cs.remote_hls_enabled {
+            if let Some(resp) = proxy_cluster_hls_playlist(state, &cs, &rsid, ctx, &tqs).await {
+                return resp;
+            }
         }
     }
 
@@ -1358,8 +1404,10 @@ async fn handle_media_play_seg(
     // Fast-path for cluster HLS segments: proxy directly over warm Keep-Alive pool (0 local RAM)
     let cluster_info = state.cluster_streams.read().get(&rsid).cloned();
     if let Some(cs) = cluster_info {
-        if let Some(resp) = proxy_cluster_hls_segment(state, &cs, seg_name, ctx).await {
-            return resp;
+        if cs.remote_hls_enabled {
+            if let Some(resp) = proxy_cluster_hls_segment(state, &cs, seg_name, ctx).await {
+                return resp;
+            }
         }
     }
 
@@ -1417,7 +1465,8 @@ async fn proxy_cluster_hls_playlist(
     ctx: &MediaReqCtx<'_>,
     tqs: &str,
 ) -> Option<Response<RespBody>> {
-    let url = format!("http://{}/play/{}.m3u8", cs.host_port, cs.orig_id);
+    let qs = cs.auth_query.as_deref().unwrap_or("");
+    let url = format!("http://{}/play/{}.m3u8{}", cs.host_port, cs.orig_id, qs);
     let mut req = state
         .http_client
         .get(&url)
@@ -1488,9 +1537,10 @@ async fn proxy_cluster_hls_segment(
     seg_name: &str,
     ctx: &MediaReqCtx<'_>,
 ) -> Option<Response<RespBody>> {
+    let qs = cs.auth_query.as_deref().unwrap_or("");
     let url = format!(
-        "http://{}/play/{}/segment/{}",
-        cs.host_port, cs.orig_id, seg_name
+        "http://{}/play/{}/segment/{}{}",
+        cs.host_port, cs.orig_id, seg_name, qs
     );
     let mut req = state
         .http_client
@@ -2913,6 +2963,47 @@ fn emit_scan(state: &AppState, sc: &ScanEntry) {
     }
 }
 
+fn encode_cluster_auth_part(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~' | b'!') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{:02X}", b));
+        }
+    }
+    out
+}
+
+fn build_cluster_auth_query(user: &str, pass: &str) -> Option<String> {
+    if user.is_empty() {
+        return None;
+    }
+    if pass.is_empty() {
+        Some(format!("?auth={}", encode_cluster_auth_part(user)))
+    } else {
+        Some(format!(
+            "?auth={}:{}",
+            encode_cluster_auth_part(user),
+            encode_cluster_auth_part(pass)
+        ))
+    }
+}
+
+fn detect_remote_hls_enabled(rcfg: &Value) -> bool {
+    let Some(settings) = rcfg.get("settings").and_then(|v| v.as_object()) else {
+        return true;
+    };
+    if settings.contains_key("http_play_hls") {
+        return get_bool_field(rcfg.get("settings"), "http_play_hls", true);
+    }
+    // Cesbo Astra omits `http_play_hls` when only `http_play_stream: true` is enabled.
+    if settings.contains_key("http_play_stream") {
+        return false;
+    }
+    true
+}
+
 async fn sync_cluster_once(state: &Arc<AppState>) {
     let snap = state.config();
     let servers: Vec<Value> = snap
@@ -2946,6 +3037,7 @@ async fn sync_cluster_once(state: &Arc<AppState>) {
         } else {
             None
         };
+        let auth_query = build_cluster_auth_query(&ruser, &rpass);
         let client = state.http_client.clone();
         futs.push(async move {
             let mut req = client
@@ -2964,7 +3056,7 @@ async fn sync_cluster_once(state: &Arc<AppState>) {
             }
             let raw_bytes = resp.bytes().await.ok()?;
             let rcfg = serde_json::from_slice::<Value>(&raw_bytes).ok()?;
-            Some((hp, auth_header, rcfg))
+            Some((hp, auth_header, auth_query, rcfg))
         });
     }
 
@@ -2975,7 +3067,8 @@ async fn sync_cluster_once(state: &Arc<AppState>) {
     let mut new_plain = HashMap::new();
 
     for item in results.into_iter().flatten() {
-        let (hp, auth_header, rcfg) = item;
+        let (hp, auth_header, auth_query, rcfg) = item;
+        let remote_hls_enabled = detect_remote_hls_enabled(&rcfg);
         let Some(rms) = rcfg.get("make_stream").and_then(|v| v.as_array()) else {
             continue;
         };
@@ -2991,8 +3084,15 @@ async fn sync_cluster_once(state: &Arc<AppState>) {
             let eff_id = format!("cluster_{}_{}", hp.replace([':', '.'], "_"), orig_id);
             let mut proxied = s.clone();
             proxied["id"] = json!(eff_id);
-            let play_url = format!("http://{}/play/{}", hp, orig_id);
-            proxied["input"] = json!([play_url]);
+            let display_play_url = format!("http://{}/play/{}", hp, orig_id);
+            // Cesbo Astra rejects Basic auth on /play/{id} (403) and requires ?auth=user:pass;
+            // passing both ?auth= and Authorization: Basic works with Cesbo Astra AND Astrika/astrag!
+            let play_url = format!(
+                "{}{}",
+                display_play_url,
+                auth_query.as_deref().unwrap_or("")
+            );
+            proxied["input"] = json!([display_play_url]);
 
             new_aliases.insert((hp.clone(), orig_id.to_string()), eff_id.clone());
             new_plain
@@ -3001,7 +3101,11 @@ async fn sync_cluster_once(state: &Arc<AppState>) {
 
             let name = s.get("name").and_then(|v| v.as_str()).unwrap_or(orig_id);
             let needs_insert = match state.channels.get(&eff_id) {
-                Some(existing) => existing.name != name || existing.auth_header != auth_header,
+                Some(existing) => {
+                    existing.name != name
+                        || existing.auth_header != auth_header
+                        || existing.urls.first().map(|u| u.as_str()) != Some(play_url.as_str())
+                }
                 None => true,
             };
             if needs_insert {
@@ -3034,6 +3138,8 @@ async fn sync_cluster_once(state: &Arc<AppState>) {
                     orig_id: orig_id.to_string(),
                     host_port: hp.clone(),
                     auth_header: auth_header.clone(),
+                    auth_query: auth_query.clone(),
+                    remote_hls_enabled,
                     cfg: proxied,
                 },
             );
@@ -3117,5 +3223,98 @@ mod tests {
         );
         assert_eq!(r2.status(), StatusCode::NOT_MODIFIED);
         state.shutdown_all();
+    }
+
+    #[test]
+    fn http_output_routes_m3u8_and_plain_paths_correctly() {
+        let routes = vec![
+            crate::config::HttpOutputRoute {
+                stream_id: "rferl".to_string(),
+                port: 8000,
+                path: "/curent/index.m3u8".to_string(),
+            },
+            crate::config::HttpOutputRoute {
+                stream_id: "sport4".to_string(),
+                port: 18000,
+                path: "/sport4/index.m3u8".to_string(),
+            },
+            crate::config::HttpOutputRoute {
+                stream_id: "ch666".to_string(),
+                port: 18000,
+                path: "/666/index.m3u8".to_string(),
+            },
+            crate::config::HttpOutputRoute {
+                stream_id: "ch666".to_string(),
+                port: 18000,
+                path: "/666".to_string(),
+            },
+            crate::config::HttpOutputRoute {
+                stream_id: "plain".to_string(),
+                port: 8000,
+                path: "/live/ch1".to_string(),
+            },
+        ];
+
+        assert_eq!(
+            match_http_output_routes(&routes, "/curent/index.m3u8", 8000),
+            Some(("rferl".to_string(), 1, String::new()))
+        );
+        assert_eq!(
+            match_http_output_routes(&routes, "/curent.m3u8", 8000),
+            Some(("rferl".to_string(), 1, String::new()))
+        );
+        assert_eq!(
+            match_http_output_routes(&routes, "/curent/segment/segment-3.ts", 8000),
+            Some(("rferl".to_string(), 2, "segment-3.ts".to_string()))
+        );
+        assert_eq!(
+            match_http_output_routes(&routes, "/curent", 8000),
+            Some(("rferl".to_string(), 0, String::new()))
+        );
+        assert_eq!(
+            match_http_output_routes(&routes, "/sport4/index.m3u8", 18000),
+            Some(("sport4".to_string(), 1, String::new()))
+        );
+        assert_eq!(
+            match_http_output_routes(&routes, "/666/index.m3u8", 18000),
+            Some(("ch666".to_string(), 1, String::new()))
+        );
+        assert_eq!(
+            match_http_output_routes(&routes, "/666", 18000),
+            Some(("ch666".to_string(), 0, String::new()))
+        );
+        assert_eq!(
+            match_http_output_routes(&routes, "/live/ch1", 8000),
+            Some(("plain".to_string(), 0, String::new()))
+        );
+        assert_eq!(
+            match_http_output_routes(&routes, "/live/ch1/index.m3u8", 8000),
+            Some(("plain".to_string(), 1, String::new()))
+        );
+    }
+
+    #[test]
+    fn cluster_auth_query_and_remote_hls_detection() {
+        assert_eq!(build_cluster_auth_query("", ""), None);
+        assert_eq!(
+            build_cluster_auth_query("admin", "pass123!"),
+            Some("?auth=admin:pass123!".to_string())
+        );
+        assert_eq!(
+            build_cluster_auth_query("admin", "p@ss#1"),
+            Some("?auth=admin:p%40ss%231".to_string())
+        );
+
+        // Cesbo Astra with only http_play_stream: true
+        let cesbo_ts_only = json!({"settings": {"http_play_stream": true}});
+        assert!(!detect_remote_hls_enabled(&cesbo_ts_only));
+
+        // Cesbo Astra / Astrika with http_play_hls: true
+        let with_hls = json!({"settings": {"http_play_stream": true, "http_play_hls": true}});
+        assert!(detect_remote_hls_enabled(&with_hls));
+
+        // Explicit false
+        let disabled_hls = json!({"settings": {"http_play_hls": false}});
+        assert!(!detect_remote_hls_enabled(&disabled_hls));
     }
 }

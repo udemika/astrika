@@ -371,7 +371,7 @@ impl Channel {
             st.last_data = now_s;
 
             // Immediate UHD ring growth: prevent 4 MB initial ring from wrapping on 15-40 Mbps UHD streams
-            // or large UHD HLS segments before tick_1s() runs (zero RAM cost for SD/HD or idle channels).
+            // or large UHD HLS segments before tick_1s() runs (zero RAM bloat for SD/HD HLS burst or idle channels).
             const MAX_RING: usize = 32 * 1024 * 1024;
             let rcap = st.ts.rcap();
             if rcap < MAX_RING {
@@ -379,7 +379,7 @@ impl Channel {
                 if need_for_chunk > rcap {
                     let want = need_for_chunk.min(MAX_RING);
                     st.ts.ring_resize(want);
-                } else {
+                } else if !hls_in {
                     let elapsed = now_s - st.in_started;
                     if elapsed > 0.05 && elapsed < 3.0 {
                         let projected_wpos = st.ts.wpos + data.len() as u64;
@@ -556,7 +556,16 @@ impl Channel {
         st.ts.scrambled = st.ts.scr_win;
         st.ts.scr_win = false;
 
-        let bps = st.bitrate.max(st.ts.pcr_bitrate) / 8.0;
+        let eff_br = if st.mode == InputMode::Hls && (now_s - st.in_started) < 4.0 {
+            if st.ts.pcr_bitrate > 0.0 {
+                st.ts.pcr_bitrate
+            } else {
+                st.bitrate.min(20_000_000.0)
+            }
+        } else {
+            st.bitrate.max(st.ts.pcr_bitrate)
+        };
+        let bps = eff_br / 8.0;
         let secs = (st.ts.gop + START_BURST_S + 1.5).max(8.0);
         let want = (bps * secs).clamp(1.5 * 1024.0 * 1024.0, 32.0 * 1024.0 * 1024.0) as usize;
         let rcap = st.ts.rcap();
@@ -1313,7 +1322,7 @@ async fn run_hls_input(
                         }
                     }
                     match tokio::time::timeout(
-                        Duration::from_secs(8),
+                        Duration::from_secs(10),
                         ch.http_client.get(&pl_url).headers(hdrs).send(),
                     )
                     .await
@@ -1607,7 +1616,7 @@ async fn run_hls_input(
                                             }
                                         }
                                         if let Ok(Ok(resp)) = tokio::time::timeout(
-                                            Duration::from_secs(3),
+                                            Duration::from_secs(5),
                                             ch.http_client.get(&pl_url).headers(hdrs).send(),
                                         )
                                         .await
