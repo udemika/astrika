@@ -1,0 +1,47 @@
+name: Build & Release Static Linux Binary
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install musl-tools
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - name: Run unit tests
+        run: cargo test --release
+
+      - name: Build static x86_64-unknown-linux-musl binary
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          RUSTFLAGS: "-C target-feature=+crt-static"
+        run: |
+          cargo build --release --target x86_64-unknown-linux-musl
+          cp target/x86_64-unknown-linux-musl/release/astrika astrika-linux-x86_64-musl
+          file astrika-linux-x86_64-musl
+          ./astrika-linux-x86_64-musl --version
+          ls -lh astrika-linux-x86_64-musl
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: astrika-linux-x86_64-musl
+          path: astrika-linux-x86_64-musl
+
+      - name: Publish Release Asset
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: astrika-linux-x86_64-musl

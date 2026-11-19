@@ -1,0 +1,22 @@
+[Unit]
+Description=Astrika IPTV Streaming Server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=astrika
+Group=astrika
+Environment="ASTRIKA_CONFIG_FILE=/etc/astrika/astrika.conf"
+ExecStart=/usr/bin/astrika -c /etc/astrika/astrika.conf -p 8000
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=3
+LimitNOFILE=65536
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ReadWritePaths=/etc/astrika /var/lib/astrika
+
+[Install]
+WantedBy=multi-user.target

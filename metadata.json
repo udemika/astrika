@@ -1,0 +1,6 @@
+{
+  "name": "Astrika",
+  "description": "High-performance static Rust IPTV streaming server for Ubuntu 20.04/22.04/24.04",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
