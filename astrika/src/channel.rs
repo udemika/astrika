@@ -645,7 +645,7 @@ fn seg_elapsed(st: &ChannelInner, pcr: i64, now_s: f64) -> f64 {
 
 fn seg_begin(st: &mut ChannelInner, pcr: i64, wall: f64) {
     if st.cseg.capacity() == 0 && st.last_seg_bytes > 0 {
-        let est = (st.last_seg_bytes + st.last_seg_bytes / 10).clamp(64 * 1024, 10 * 1024 * 1024);
+        let est = (st.last_seg_bytes + st.last_seg_bytes / 10).clamp(64 * 1024, 20 * 1024 * 1024);
         st.cseg = Vec::with_capacity(est);
     } else {
         st.cseg.clear();
@@ -710,17 +710,28 @@ fn seg_finish(st: &mut ChannelInner, seg_target: f64, seg_keep: usize, now_s: f6
         disc: st.cur_disc,
         data: Arc::new(Bytes::from(buf)),
     };
-    // RFC 8216 live window: keep 4 segments (~8s) ready when idle for rock-solid UHD open,
-    // and expand to >= 6 segments (~12s) while an HLS viewer is actively watching!
-    let keep = if now_s - st.hls_last_req > 60.0 {
-        seg_keep.clamp(3, 4)
-    } else {
+    // Duration-aware RFC 8216 live window:
+    // - Always keep >= 3 segments (RFC 8216 live minimum).
+    // - 2s segments keep 4 idle (~8s) / 6 active (~12s) for instant UHD open and smooth playback.
+    // - Long-GOP 10s 4K segments (~16 MB each) cap at 3 segments (30s) instead of 60s (~96 MB).
+    let active_hls = now_s - st.hls_last_req <= 60.0;
+    let max_segs = if active_hls {
         seg_keep.max(6)
+    } else {
+        seg_keep.clamp(3, 4)
     };
-    while !st.segs.is_empty() && (st.segs.len() >= 16 || st.segs.len() >= keep) {
-        st.segs.pop_front();
-    }
+    let max_win_s = if active_hls { 18.0 } else { 12.0 };
     st.segs.push_back(seg);
+    let mut total_dur: f64 = st.segs.iter().map(|s| s.dur).sum();
+    while st.segs.len() > 3
+        && (st.segs.len() > 16
+            || st.segs.len() > max_segs
+            || total_dur - st.segs.front().map(|s| s.dur).unwrap_or(0.0) >= max_win_s)
+    {
+        if let Some(old) = st.segs.pop_front() {
+            total_dur -= old.dur;
+        }
+    }
     let first_seq = st.segs.front().map(|s| s.seq).unwrap_or(0);
     st.playlist_etag = format!("\"s{}-{}\"", first_seq, seq);
     true
@@ -1762,8 +1773,15 @@ async fn run_hls_input(
             }
         }
 
-        // 2. Adaptive parallel segment prefetch (3 during cold burst for instant start, 2 steady-state for rock-solid UHD)
-        let parallel_cap = if burst_done { 2 } else { 3 };
+        // 2. Adaptive parallel segment prefetch (3 burst / 2 steady-state; for >=8s long-GOP
+        //    segments, 1 steady-state prefetch is already 8-10s ahead while saving ~16 MB RAM)
+        let parallel_cap = if !burst_done {
+            if td >= 8.0 { 2 } else { 3 }
+        } else if td >= 8.0 {
+            1
+        } else {
+            2
+        };
         spawn_refill_inflight(ch, ua, td, parallel_cap, &mut queue, &mut inflight);
 
         // 3. Consume front in-flight segment in strict playback order
@@ -1822,7 +1840,13 @@ async fn run_hls_input(
                         }
 
                         // Pre-refill inflight IMMEDIATELY before pacing so UHD segments always download ahead!
-                        let refill_cap = if burst_done { 2 } else { 3 };
+                        let refill_cap = if !burst_done {
+                            if td >= 8.0 { 2 } else { 3 }
+                        } else if td >= 8.0 {
+                            1
+                        } else {
+                            2
+                        };
                         spawn_refill_inflight(ch, ua, td, refill_cap, &mut queue, &mut inflight);
 
                         // Feed segment: burst immediately in 256 KB chunks (prevents 16 MB scratch_pkts bloat!)
@@ -1909,11 +1933,12 @@ async fn run_hls_input(
                                                 break;
                                             }
                                             PollOutcome::Continue | PollOutcome::FollowMaster => {
+                                                let cap = if td >= 8.0 { 1 } else { 2 };
                                                 spawn_refill_inflight(
                                                     ch,
                                                     ua,
                                                     td,
-                                                    2,
+                                                    cap,
                                                     &mut queue,
                                                     &mut inflight,
                                                 );
@@ -2187,5 +2212,53 @@ mod tests {
         }
         assert_eq!(pat_ccs, vec![0, 1, 2, 3]);
         assert_eq!(pmt_ccs, vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn hls_window_caps_long_gop_segments_while_keeping_short_segments_deep() {
+        let client = Client::new();
+        let ch = Channel::new(
+            "win1".into(),
+            "Window Test".into(),
+            vec!["http://127.0.0.1:9999/w.ts".into()],
+            vec![],
+            2.0,
+            5,
+            false,
+            20.0,
+            false,
+            String::new(),
+            String::new(),
+            None,
+            client,
+            AesKeyCache::new(),
+            Instant::now(),
+        );
+        let mut st = ch.inner.lock();
+        let dummy = vec![0x47u8; TS * 10];
+
+        // 1. 2-second segments when idle (now_s=200, hls_last_req=0) -> keeps 4
+        st.hls_last_req = 0.0;
+        for _ in 0..8 {
+            st.cseg.extend_from_slice(&dummy);
+            assert!(seg_finish(&mut st, 2.0, 5, 200.0, 2.0));
+        }
+        assert_eq!(st.segs.len(), 4);
+
+        // 2. 2-second segments when active HLS viewer -> expands to 6 (~12s <= 18s)
+        st.hls_last_req = 199.0;
+        for _ in 0..4 {
+            st.cseg.extend_from_slice(&dummy);
+            assert!(seg_finish(&mut st, 2.0, 5, 200.0, 2.0));
+        }
+        assert_eq!(st.segs.len(), 6);
+
+        // 3. 10-second 4K segments even with active HLS viewer -> capped at 3 (30s >= 18s)
+        st.segs.clear();
+        for _ in 0..6 {
+            st.cseg.extend_from_slice(&dummy);
+            assert!(seg_finish(&mut st, 2.0, 5, 200.0, 10.0));
+        }
+        assert_eq!(st.segs.len(), 3);
     }
 }
