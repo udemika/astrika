@@ -111,6 +111,7 @@ pub struct ChannelInner {
     pub segs: VecDeque<OutSeg>,
     pub next_seq: i64,
     pub playlist_etag: String,
+    pub hls_psi_cc: [(u16, i8); 9],
 
     // Reusable scratch buffers (zero heap churn per chunk)
     scratch_pkts: Vec<u8>,
@@ -225,6 +226,7 @@ impl Channel {
             segs: VecDeque::with_capacity(8),
             next_seq: 0,
             playlist_etag: String::new(),
+            hls_psi_cc: [(0xFFFF, -1); 9],
             scratch_pkts: Vec::new(),
             scratch_kfs: Vec::new(),
             udp_outs,
@@ -290,8 +292,8 @@ impl Channel {
         if st.mode != InputMode::Idle {
             return false;
         }
-        // Balanced initial ring: ~1.5 MB for cluster channels, ~3.0 MB for direct sources (grows dynamically for UHD)
-        let init_ring = if self.is_cluster { TS * 8192 } else { TS * 16000 };
+        // Generous initial ring (~4.5 MB) for all channels including HD/UHD cluster streams (zero RAM when idle)
+        let init_ring = TS * 24000;
         st.ts.alloc_ring(init_ring);
         st.ts.reset_out_cc();
         st.ts.reset_psi();
@@ -302,6 +304,7 @@ impl Channel {
         st.hls_on = true;
         st.cur_started = false;
         st.cseg.clear();
+        st.hls_psi_cc = [(0xFFFF, -1); 9];
         st.fails_row = 0;
         st.cur_url = 0;
         st.last_error.clear();
@@ -374,7 +377,7 @@ impl Channel {
 
             // Immediate UHD ring growth: prevent initial ring from wrapping on 15-40 Mbps UHD streams
             // or large UHD HLS segments before tick_1s() runs (zero RAM bloat for SD/HD or idle channels).
-            const MAX_RING: usize = 24 * 1024 * 1024;
+            const MAX_RING: usize = 28 * 1024 * 1024;
             let rcap = st.ts.rcap();
             if rcap < MAX_RING {
                 let need_for_chunk = data.len().saturating_mul(3);
@@ -575,8 +578,8 @@ impl Channel {
             st.bitrate.max(st.ts.pcr_bitrate)
         };
         let bps = eff_br / 8.0;
-        let secs = (st.ts.gop.min(6.0) + 4.0).clamp(6.0, 10.0);
-        let want = (bps * secs).clamp(1.5 * 1024.0 * 1024.0, 24.0 * 1024.0 * 1024.0) as usize;
+        let secs = (st.ts.gop.min(6.0) + 5.0).clamp(7.5, 12.0);
+        let want = (bps * secs).clamp(2.0 * 1024.0 * 1024.0, 28.0 * 1024.0 * 1024.0) as usize;
         let rcap = st.ts.rcap();
         if rcap > 0 {
             if want as f64 > rcap as f64 * 1.25 {
@@ -642,7 +645,7 @@ fn seg_elapsed(st: &ChannelInner, pcr: i64, now_s: f64) -> f64 {
 
 fn seg_begin(st: &mut ChannelInner, pcr: i64, wall: f64) {
     if st.cseg.capacity() == 0 && st.last_seg_bytes > 0 {
-        let est = (st.last_seg_bytes + st.last_seg_bytes / 10).clamp(64 * 1024, 8 * 1024 * 1024);
+        let est = (st.last_seg_bytes + st.last_seg_bytes / 10).clamp(64 * 1024, 10 * 1024 * 1024);
         st.cseg = Vec::with_capacity(est);
     } else {
         st.cseg.clear();
@@ -655,6 +658,22 @@ fn seg_begin(st: &mut ChannelInner, pcr: i64, wall: f64) {
     st.disc_pending = false;
 }
 
+#[inline]
+fn next_hls_psi_cc(table: &mut [(u16, i8); 9], pid: u16) -> u8 {
+    for slot in table.iter_mut() {
+        if slot.0 == pid {
+            slot.1 = (slot.1 + 1) & 15;
+            return slot.1 as u8;
+        }
+        if slot.0 == 0xFFFF {
+            slot.0 = pid;
+            slot.1 = 0;
+            return 0;
+        }
+    }
+    0
+}
+
 fn seg_finish(st: &mut ChannelInner, seg_target: f64, seg_keep: usize, now_s: f64, dur: f64) -> bool {
     if st.cseg.len() < TS * 8 {
         return false;
@@ -662,6 +681,20 @@ fn seg_finish(st: &mut ChannelInner, seg_target: f64, seg_keep: usize, now_s: f6
     let seq = st.next_seq;
     st.next_seq += 1;
     let mut buf = std::mem::take(&mut st.cseg);
+    // Keep PAT/PMT continuity counters strictly monotonic across consecutive HLS segments
+    // without touching st.ts.out_cc (leaves HTTP-TS ring untouched, 0 CC errors in HLS players).
+    let npmt = st.ts.npmt.min(8);
+    let pmt_pids = st.ts.pmt_pid;
+    let mut off = 0usize;
+    while off + TS <= buf.len() {
+        let pid = (((buf[off + 1] & 0x1F) as u16) << 8) | buf[off + 2] as u16;
+        let is_psi = pid == 0 || (npmt > 0 && pmt_pids[..npmt].contains(&pid));
+        if is_psi && (buf[off + 3] & 0x10) != 0 {
+            let cc = next_hls_psi_cc(&mut st.hls_psi_cc, pid);
+            buf[off + 3] = (buf[off + 3] & 0xF0) | cc;
+        }
+        off += TS;
+    }
     st.last_seg_bytes = if st.last_seg_bytes == 0 {
         buf.len()
     } else {
@@ -677,11 +710,12 @@ fn seg_finish(st: &mut ChannelInner, seg_target: f64, seg_keep: usize, now_s: f6
         disc: st.cur_disc,
         data: Arc::new(Bytes::from(buf)),
     };
-    // When no HLS viewer is active (>60s idle), keep 2 ready segments for instant 0ms open while saving 1 UHD segment of RAM
+    // RFC 8216 live window: keep 4 segments (~8s) ready when idle for rock-solid UHD open,
+    // and expand to >= 6 segments (~12s) while an HLS viewer is actively watching!
     let keep = if now_s - st.hls_last_req > 60.0 {
-        2
+        seg_keep.clamp(3, 4)
     } else {
-        seg_keep
+        seg_keep.max(6)
     };
     while !st.segs.is_empty() && (st.segs.len() >= 16 || st.segs.len() >= keep) {
         st.segs.pop_front();
@@ -1094,9 +1128,9 @@ enum TsOrHls {
 async fn run_http_ts_or_probe(ch: &Arc<Channel>, url: &str, ua: &str) -> TsOrHls {
     ch.inner.lock().mode = InputMode::Ts;
     let conn_to = Duration::from_secs_f64(if ch.is_cluster {
-        3.5
+        6.0
     } else if ch.urls.len() > 1 {
-        4.5
+        5.0
     } else {
         8.0
     });
@@ -1236,28 +1270,62 @@ async fn fetch_segment_task(
         None
     };
 
-    let mut req = client
-        .get(&seg.url)
-        .header(USER_AGENT, &ua)
-        .header("Accept", "*/*");
-    if let Some((off, len)) = seg.byterange {
-        let end = off + len.saturating_sub(1);
-        req = req.header(RANGE, format!("bytes={}-{}", off, end));
-    }
+    let mut last_err = String::new();
+    let mut raw = Bytes::new();
+    let mut status = 0u16;
+    for attempt in 0..2u8 {
+        if attempt > 0 {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+        }
+        let mut req = client
+            .get(&seg.url)
+            .header(USER_AGENT, &ua)
+            .header("Accept", "*/*")
+            .header("Accept-Encoding", "identity");
+        if let Some((off, len)) = seg.byterange {
+            let end = off + len.saturating_sub(1);
+            req = req.header(RANGE, format!("bytes={}-{}", off, end));
+        }
 
-    let resp = tokio::time::timeout(timeout, req.send())
-        .await
-        .map_err(|_| "segment connect timeout".to_string())?
-        .map_err(|e| format!("segment fetch error: {}", e))?;
+        let resp = match tokio::time::timeout(timeout, req.send()).await {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => {
+                last_err = format!("segment fetch error: {}", e);
+                continue;
+            }
+            Err(_) => {
+                last_err = "segment connect timeout".to_string();
+                continue;
+            }
+        };
 
-    let status = resp.status().as_u16();
-    if status != 200 && status != 206 {
-        return Ok((Bytes::new(), status));
+        status = resp.status().as_u16();
+        if status >= 500 && attempt == 0 {
+            last_err = format!("segment HTTP {}", status);
+            continue;
+        }
+        if status != 200 && status != 206 {
+            return Ok((Bytes::new(), status));
+        }
+        match tokio::time::timeout(timeout, resp.bytes()).await {
+            Ok(Ok(b)) => {
+                raw = b;
+                last_err.clear();
+                break;
+            }
+            Ok(Err(e)) => {
+                last_err = format!("segment body error: {}", e);
+                continue;
+            }
+            Err(_) => {
+                last_err = "segment read timeout".to_string();
+                continue;
+            }
+        }
     }
-    let raw = tokio::time::timeout(timeout, resp.bytes())
-        .await
-        .map_err(|_| "segment read timeout".to_string())?
-        .map_err(|e| format!("segment body error: {}", e))?;
+    if !last_err.is_empty() {
+        return Err(last_err);
+    }
 
     if raw.len() > 96 * 1024 * 1024 {
         return Err("segment too large".to_string());
@@ -1281,6 +1349,260 @@ async fn fetch_segment_task(
     };
 
     Ok((payload, status))
+}
+
+type PlaylistPollResult = Result<Option<(String, String, Option<String>, Option<String>)>, (String, u16)>;
+
+async fn fetch_playlist_once(
+    client: Client,
+    url: String,
+    ua: String,
+    etag: Option<String>,
+    last_mod: Option<String>,
+    timeout: Duration,
+) -> PlaylistPollResult {
+    let mut hdrs = HeaderMap::new();
+    if let Ok(v) = HeaderValue::from_str(&ua) {
+        hdrs.insert(USER_AGENT, v);
+    }
+    if let Some(ref e) = etag {
+        if let Ok(v) = HeaderValue::from_str(e) {
+            hdrs.insert(IF_NONE_MATCH, v);
+        }
+    }
+    if let Some(ref lm) = last_mod {
+        if let Ok(v) = HeaderValue::from_str(lm) {
+            hdrs.insert(IF_MODIFIED_SINCE, v);
+        }
+    }
+    match tokio::time::timeout(timeout, client.get(&url).headers(hdrs).send()).await {
+        Ok(Ok(resp)) => {
+            let status = resp.status().as_u16();
+            if status == 304 {
+                Ok(None)
+            } else if status != 200 {
+                Err((format!("playlist HTTP {}", status), status))
+            } else {
+                let new_etag = resp
+                    .headers()
+                    .get(ETAG)
+                    .and_then(|v| v.to_str().ok())
+                    .map(|s| s.to_string());
+                let new_lm = resp
+                    .headers()
+                    .get(LAST_MODIFIED)
+                    .and_then(|v| v.to_str().ok())
+                    .map(|s| s.to_string());
+                let final_u = resp.url().to_string();
+                match tokio::time::timeout(timeout, resp.text()).await {
+                    Ok(Ok(t)) => Ok(Some((final_u, t, new_etag, new_lm))),
+                    Ok(Err(e)) => Err((format!("playlist read: {}", e), 0)),
+                    Err(_) => Err(("playlist read timeout".to_string(), 0)),
+                }
+            }
+        }
+        Ok(Err(e)) => Err((format!("playlist fetch: {}", e), 0)),
+        Err(_) => Err(("playlist timeout".to_string(), 0)),
+    }
+}
+
+enum PollOutcome {
+    Continue,
+    FollowMaster,
+    Fatal(String),
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_playlist_result(
+    ch: &Arc<Channel>,
+    master_url: &str,
+    ua: &str,
+    res: PlaylistPollResult,
+    pl_url: &mut String,
+    etag: &mut Option<String>,
+    last_mod: &mut Option<String>,
+    first: &mut bool,
+    td: &mut f64,
+    last_seq: &mut i64,
+    seen: &mut SeenSet,
+    queue: &mut VecDeque<HlsSegment>,
+    pl_err: &mut usize,
+    next_poll: &mut Instant,
+) -> PollOutcome {
+    match res {
+        Ok(None) => {
+            // 304 Not Modified — zero parsing CPU!
+            *pl_err = 0;
+            *next_poll = Instant::now() + Duration::from_secs_f64((*td * 0.25).clamp(0.4, 1.2));
+            PollOutcome::Continue
+        }
+        Ok(Some((base, text, new_etag, new_lm))) => {
+            if let Some(e) = new_etag {
+                *etag = Some(e);
+            }
+            if let Some(lm) = new_lm {
+                *last_mod = Some(lm);
+            }
+            match parse_m3u8(&text, &base) {
+                Ok(ParsedPlaylist::Master { best_uri, .. }) => {
+                    *pl_url = best_uri.clone();
+                    *etag = None;
+                    *last_mod = None;
+                    ch.inner.lock().cached_variant = Some((best_uri, Instant::now()));
+                    *next_poll = Instant::now();
+                    PollOutcome::FollowMaster
+                }
+                Ok(ParsedPlaylist::Media {
+                    target_duration,
+                    has_media_sequence,
+                    segments,
+                    ..
+                }) => {
+                    if target_duration > 0.0 {
+                        *td = target_duration;
+                    }
+                    if pl_url.as_str() != master_url {
+                        ch.inner.lock().cached_variant = Some((pl_url.clone(), Instant::now()));
+                    }
+                    // Pre-warm AES-128 key immediately if any segment uses an uncached key
+                    for s in &segments {
+                        if let Some(ref ku) = s.key_url {
+                            if ch.key_cache.get(ku).is_none() {
+                                let c = ch.http_client.clone();
+                                let kc = ch.key_cache.clone();
+                                let kurl = ku.clone();
+                                let u = ua.to_string();
+                                tokio::spawn(async move {
+                                    if let Ok(k) = fetch_key_bytes(&c, &kurl, &u).await {
+                                        kc.insert(kurl, k);
+                                    }
+                                });
+                                break;
+                            }
+                        }
+                    }
+
+                    if has_media_sequence
+                        && !segments.is_empty()
+                        && *last_seq >= 0
+                        && segments.last().unwrap().seq < *last_seq - 50
+                    {
+                        *last_seq = -1;
+                    }
+
+                    let mut new_segs = Vec::new();
+                    for s in segments {
+                        let dk = seg_dedup_key(&s.url);
+                        let is_new = if has_media_sequence {
+                            s.seq > *last_seq
+                        } else {
+                            !seen.contains(dk)
+                        };
+                        if is_new {
+                            new_segs.push((s, dk));
+                        }
+                    }
+
+                    let limit = if *first {
+                        if *td <= 5.0 { 4 } else { 3 }
+                    } else if *td <= 6.0 {
+                        3
+                    } else {
+                        2
+                    };
+                    let skip = new_segs.len().saturating_sub(limit);
+                    *first = false;
+                    let mut added = 0usize;
+                    for (idx, (s, dk)) in new_segs.into_iter().enumerate() {
+                        seen.insert(dk);
+                        if s.seq > *last_seq {
+                            *last_seq = s.seq;
+                        }
+                        if idx < skip || queue.len() >= 24 {
+                            continue;
+                        }
+                        queue.push_back(s);
+                        added += 1;
+                    }
+                    *pl_err = 0;
+                    let td2 = if *td > 0.0 { *td } else { 6.0 };
+                    let wait_s = if added > 0 {
+                        (td2 * 0.42).clamp(0.3, 1.8)
+                    } else {
+                        (td2 * 0.22).clamp(0.4, 1.1)
+                    };
+                    *next_poll = Instant::now() + Duration::from_secs_f64(wait_s);
+                    PollOutcome::Continue
+                }
+                Err(e) => {
+                    *pl_err += 1;
+                    ch.inner.lock().last_error = e.clone();
+                    if pl_url.as_str() != master_url {
+                        *pl_url = master_url.to_string();
+                        *etag = None;
+                        *last_mod = None;
+                        ch.inner.lock().cached_variant = None;
+                    }
+                    if *first || *pl_err >= 8 {
+                        return PollOutcome::Fatal(e);
+                    }
+                    *next_poll =
+                        Instant::now() + Duration::from_secs_f64((0.3 * *pl_err as f64).min(2.0));
+                    PollOutcome::Continue
+                }
+            }
+        }
+        Err((msg, _status)) => {
+            *pl_err += 1;
+            ch.inner.lock().last_error = msg.clone();
+            if pl_url.as_str() != master_url {
+                *pl_url = master_url.to_string();
+                *etag = None;
+                *last_mod = None;
+                ch.inner.lock().cached_variant = None;
+            }
+            if *first || *pl_err >= 8 {
+                return PollOutcome::Fatal(msg);
+            }
+            *next_poll = Instant::now() + Duration::from_secs_f64((0.3 * *pl_err as f64).min(2.0));
+            PollOutcome::Continue
+        }
+    }
+}
+
+fn spawn_refill_inflight(
+    ch: &Arc<Channel>,
+    ua: &str,
+    td: f64,
+    cap: usize,
+    queue: &mut VecDeque<HlsSegment>,
+    inflight: &mut VecDeque<PendingSeg>,
+) {
+    while inflight.len() < cap {
+        let Some(seg) = queue.pop_front() else {
+            break;
+        };
+        let timeout = Duration::from_secs_f64((td * 1.5 + 3.0).clamp(6.0, 24.0));
+        let c = ch.http_client.clone();
+        let kc = ch.key_cache.clone();
+        let u = ua.to_string();
+        let seg_clone = seg.clone();
+        let handle =
+            tokio::spawn(async move { fetch_segment_task(c, kc, seg_clone, u, timeout).await });
+        inflight.push_back(PendingSeg { seg, handle });
+    }
+}
+
+fn abort_hls_tasks(
+    inflight: VecDeque<PendingSeg>,
+    pl_poll_task: &mut Option<tokio::task::JoinHandle<PlaylistPollResult>>,
+) {
+    for p in inflight {
+        p.handle.abort();
+    }
+    if let Some(h) = pl_poll_task.take() {
+        h.abort();
+    }
 }
 
 async fn run_hls_input(
@@ -1313,6 +1635,7 @@ async fn run_hls_input(
     let mut seen = SeenSet::new(256);
     let mut queue: VecDeque<HlsSegment> = VecDeque::with_capacity(24);
     let mut inflight: VecDeque<PendingSeg> = VecDeque::with_capacity(4);
+    let mut pl_poll_task: Option<tokio::task::JoinHandle<PlaylistPollResult>> = None;
     let mut pl_err = 0usize;
     let mut consec_seg_err = 0usize;
     let mut burst_done = false;
@@ -1325,222 +1648,123 @@ async fn run_hls_input(
 
     loop {
         if !ch.alive.load(Ordering::Acquire) {
-            for p in inflight {
-                p.handle.abort();
-            }
+            abort_hls_tasks(inflight, &mut pl_poll_task);
             return "channel stopped".to_string();
         }
 
-        // 1. Poll playlist if due and queue isn't already deep
-        if pending_initial.is_some() || (Instant::now() >= next_poll && queue.len() < 6) {
-            let fetch_res: Result<Option<(String, String)>, (String, u16)> =
-                if let Some((base, body)) = pending_initial.take() {
-                    Ok(Some((base, body)))
-                } else {
-                    let mut hdrs = HeaderMap::new();
-                    if let Ok(v) = HeaderValue::from_str(ua) {
-                        hdrs.insert(USER_AGENT, v);
-                    }
-                    if let Some(ref e) = etag {
-                        if let Ok(v) = HeaderValue::from_str(e) {
-                            hdrs.insert(IF_NONE_MATCH, v);
-                        }
-                    }
-                    if let Some(ref lm) = last_mod {
-                        if let Ok(v) = HeaderValue::from_str(lm) {
-                            hdrs.insert(IF_MODIFIED_SINCE, v);
-                        }
-                    }
-                    match tokio::time::timeout(
-                        Duration::from_secs(10),
-                        ch.http_client.get(&pl_url).headers(hdrs).send(),
-                    )
-                    .await
-                    {
-                        Ok(Ok(resp)) => {
-                            let status = resp.status().as_u16();
-                            if status == 304 {
-                                Ok(None)
-                            } else if status != 200 {
-                                Err((format!("playlist HTTP {}", status), status))
-                            } else {
-                                if let Some(e) =
-                                    resp.headers().get(ETAG).and_then(|v| v.to_str().ok())
-                                {
-                                    etag = Some(e.to_string());
-                                }
-                                if let Some(lm) = resp
-                                    .headers()
-                                    .get(LAST_MODIFIED)
-                                    .and_then(|v| v.to_str().ok())
-                                {
-                                    last_mod = Some(lm.to_string());
-                                }
-                                let final_u = resp.url().to_string();
-                                match resp.text().await {
-                                    Ok(t) => Ok(Some((final_u, t))),
-                                    Err(e) => Err((format!("playlist read: {}", e), 0)),
-                                }
-                            }
-                        }
-                        Ok(Err(e)) => Err((format!("playlist fetch: {}", e), 0)),
-                        Err(_) => Err(("playlist timeout".to_string(), 0)),
-                    }
+        // 0. Harvest background playlist poll if already completed (or if we have nothing to play)
+        let should_harvest = pl_poll_task.as_ref().is_some_and(|h| {
+            h.is_finished() || (queue.is_empty() && inflight.is_empty())
+        });
+        if should_harvest {
+            if let Some(h) = pl_poll_task.take() {
+                let res = match h.await {
+                    Ok(r) => r,
+                    Err(_) => Err(("playlist task cancelled".to_string(), 0)),
                 };
-
-            match fetch_res {
-                Ok(None) => {
-                    // 304 Not Modified — zero parsing CPU!
-                    pl_err = 0;
-                    next_poll = Instant::now()
-                        + Duration::from_secs_f64((td * 0.25).clamp(0.4, 1.2));
+                match apply_playlist_result(
+                    ch,
+                    master_url,
+                    ua,
+                    res,
+                    &mut pl_url,
+                    &mut etag,
+                    &mut last_mod,
+                    &mut first,
+                    &mut td,
+                    &mut last_seq,
+                    &mut seen,
+                    &mut queue,
+                    &mut pl_err,
+                    &mut next_poll,
+                ) {
+                    PollOutcome::FollowMaster => continue,
+                    PollOutcome::Fatal(e) => {
+                        abort_hls_tasks(inflight, &mut pl_poll_task);
+                        return e;
+                    }
+                    PollOutcome::Continue => {}
                 }
-                Ok(Some((base, text))) => match parse_m3u8(&text, &base) {
-                    Ok(ParsedPlaylist::Master { best_uri, .. }) => {
-                        pl_url = best_uri.clone();
-                        etag = None;
-                        last_mod = None;
-                        ch.inner.lock().cached_variant = Some((best_uri, Instant::now()));
-                        next_poll = Instant::now();
-                        continue;
-                    }
-                    Ok(ParsedPlaylist::Media {
-                        target_duration,
-                        has_media_sequence,
-                        segments,
-                        ..
-                    }) => {
-                        if target_duration > 0.0 {
-                            td = target_duration;
-                        }
-                        if pl_url != master_url {
-                            ch.inner.lock().cached_variant = Some((pl_url.clone(), Instant::now()));
-                        }
-                        // Pre-warm AES-128 key immediately if any segment uses an uncached key
-                        for s in &segments {
-                            if let Some(ref ku) = s.key_url {
-                                if ch.key_cache.get(ku).is_none() {
-                                    let c = ch.http_client.clone();
-                                    let kc = ch.key_cache.clone();
-                                    let kurl = ku.clone();
-                                    let u = ua.to_string();
-                                    tokio::spawn(async move {
-                                        if let Ok(k) = fetch_key_bytes(&c, &kurl, &u).await {
-                                            kc.insert(kurl, k);
-                                        }
-                                    });
-                                    break;
-                                }
-                            }
-                        }
+            }
+        }
 
-                        if has_media_sequence
-                            && !segments.is_empty()
-                            && last_seq >= 0
-                            && segments.last().unwrap().seq < last_seq - 50
-                        {
-                            last_seq = -1;
-                        }
-
-                        let mut new_segs = Vec::new();
-                        for s in segments {
-                            let dk = seg_dedup_key(&s.url);
-                            let is_new = if has_media_sequence {
-                                s.seq > last_seq
-                            } else {
-                                !seen.contains(dk)
-                            };
-                            if is_new {
-                                new_segs.push((s, dk));
-                            }
-                        }
-
-                        let limit = if first {
-                            if td <= 5.0 { 4 } else { 3 }
-                        } else if td <= 6.0 {
-                            3
-                        } else {
-                            2
-                        };
-                        let skip = new_segs.len().saturating_sub(limit);
-                        first = false;
-                        let mut added = 0usize;
-                        for (idx, (s, dk)) in new_segs.into_iter().enumerate() {
-                            seen.insert(dk);
-                            if s.seq > last_seq {
-                                last_seq = s.seq;
-                            }
-                            if idx < skip || queue.len() >= 24 {
-                                continue;
-                            }
-                            queue.push_back(s);
-                            added += 1;
-                        }
-                        pl_err = 0;
-                        let td2 = if td > 0.0 { td } else { 6.0 };
-                        let wait_s = if added > 0 {
-                            (td2 * 0.42).clamp(0.3, 1.8)
-                        } else {
-                            (td2 * 0.22).clamp(0.4, 1.1)
-                        };
-                        next_poll = Instant::now() + Duration::from_secs_f64(wait_s);
+        // 1. Poll playlist if due and queue isn't already deep
+        if pending_initial.is_some()
+            || (pl_poll_task.is_none() && Instant::now() >= next_poll && queue.len() < 6)
+        {
+            if let Some((base, body)) = pending_initial.take() {
+                match apply_playlist_result(
+                    ch,
+                    master_url,
+                    ua,
+                    Ok(Some((base, body, None, None))),
+                    &mut pl_url,
+                    &mut etag,
+                    &mut last_mod,
+                    &mut first,
+                    &mut td,
+                    &mut last_seq,
+                    &mut seen,
+                    &mut queue,
+                    &mut pl_err,
+                    &mut next_poll,
+                ) {
+                    PollOutcome::FollowMaster => continue,
+                    PollOutcome::Fatal(e) => {
+                        abort_hls_tasks(inflight, &mut pl_poll_task);
+                        return e;
                     }
-                    Err(e) => {
-                        pl_err += 1;
-                        ch.inner.lock().last_error = e.clone();
-                        if pl_url != master_url {
-                            pl_url = master_url.to_string();
-                            etag = None;
-                            last_mod = None;
-                            ch.inner.lock().cached_variant = None;
-                        }
-                        if first || pl_err >= 8 {
-                            for p in inflight {
-                                p.handle.abort();
-                            }
-                            return e;
-                        }
-                        next_poll = Instant::now()
-                            + Duration::from_secs_f64((0.3 * pl_err as f64).min(2.0));
+                    PollOutcome::Continue => {}
+                }
+            } else if !queue.is_empty() || !inflight.is_empty() {
+                // Non-blocking background poll so playback never stalls on slow CDN playlist responses
+                pl_poll_task = Some(tokio::spawn(fetch_playlist_once(
+                    ch.http_client.clone(),
+                    pl_url.clone(),
+                    ua.to_string(),
+                    etag.clone(),
+                    last_mod.clone(),
+                    Duration::from_secs(8),
+                )));
+            } else {
+                let res = fetch_playlist_once(
+                    ch.http_client.clone(),
+                    pl_url.clone(),
+                    ua.to_string(),
+                    etag.clone(),
+                    last_mod.clone(),
+                    Duration::from_secs(10),
+                )
+                .await;
+                match apply_playlist_result(
+                    ch,
+                    master_url,
+                    ua,
+                    res,
+                    &mut pl_url,
+                    &mut etag,
+                    &mut last_mod,
+                    &mut first,
+                    &mut td,
+                    &mut last_seq,
+                    &mut seen,
+                    &mut queue,
+                    &mut pl_err,
+                    &mut next_poll,
+                ) {
+                    PollOutcome::FollowMaster => continue,
+                    PollOutcome::Fatal(e) => {
+                        abort_hls_tasks(inflight, &mut pl_poll_task);
+                        return e;
                     }
-                },
-                Err((msg, _status)) => {
-                    pl_err += 1;
-                    ch.inner.lock().last_error = msg.clone();
-                    if pl_url != master_url {
-                        pl_url = master_url.to_string();
-                        etag = None;
-                        last_mod = None;
-                        ch.inner.lock().cached_variant = None;
-                    }
-                    if first || pl_err >= 8 {
-                        for p in inflight {
-                            p.handle.abort();
-                        }
-                        return msg;
-                    }
-                    next_poll = Instant::now()
-                        + Duration::from_secs_f64((0.3 * pl_err as f64).min(2.0));
+                    PollOutcome::Continue => {}
                 }
             }
         }
 
         // 2. Adaptive parallel segment prefetch (3 during cold burst for instant start, 2 steady-state for rock-solid UHD)
         let parallel_cap = if burst_done { 2 } else { 3 };
-        while inflight.len() < parallel_cap {
-            let Some(seg) = queue.pop_front() else {
-                break;
-            };
-            let timeout = Duration::from_secs_f64((td * 1.5 + 3.0).clamp(6.0, 24.0));
-            let c = ch.http_client.clone();
-            let kc = ch.key_cache.clone();
-            let u = ua.to_string();
-            let seg_clone = seg.clone();
-            let handle = tokio::spawn(async move {
-                fetch_segment_task(c, kc, seg_clone, u, timeout).await
-            });
-            inflight.push_back(PendingSeg { seg, handle });
-        }
+        spawn_refill_inflight(ch, ua, td, parallel_cap, &mut queue, &mut inflight);
 
         // 3. Consume front in-flight segment in strict playback order
         if let Some(front) = inflight.pop_front() {
@@ -1549,6 +1773,7 @@ async fn run_hls_input(
             match front.handle.await {
                 Ok(Ok((payload, status))) => {
                     if status == 404 || status == 410 {
+                        ch.inner.lock().disc_pending = true;
                         if status == 410 && pl_url != master_url {
                             pl_url = master_url.to_string();
                             etag = None;
@@ -1558,6 +1783,7 @@ async fn run_hls_input(
                         continue;
                     }
                     if status == 401 || status == 403 {
+                        ch.inner.lock().disc_pending = true;
                         if pl_url != master_url {
                             pl_url = master_url.to_string();
                             etag = None;
@@ -1585,10 +1811,10 @@ async fn run_hls_input(
                             if seg_disc {
                                 st.disc_pending = true;
                             }
-                            // Pre-size ring smoothly from real segment bitrate (no overshoot, no UHD wrap)
+                            // Pre-size ring smoothly from real segment bitrate (7.5s headroom, capped at 28 MB)
                             if avg_bps > 0.0 {
-                                let want = ((avg_bps * 6.5) as usize)
-                                    .clamp(1536 * 1024, 24 * 1024 * 1024);
+                                let want = ((avg_bps * 7.5) as usize)
+                                    .clamp(2 * 1024 * 1024, 28 * 1024 * 1024);
                                 if want > st.ts.rcap().saturating_mul(5) / 4 {
                                     st.ts.ring_resize(want);
                                 }
@@ -1597,24 +1823,7 @@ async fn run_hls_input(
 
                         // Pre-refill inflight IMMEDIATELY before pacing so UHD segments always download ahead!
                         let refill_cap = if burst_done { 2 } else { 3 };
-                        while inflight.len() < refill_cap {
-                            let Some(next_seg) = queue.pop_front() else {
-                                break;
-                            };
-                            let timeout =
-                                Duration::from_secs_f64((td * 1.5 + 3.0).clamp(6.0, 24.0));
-                            let c = ch.http_client.clone();
-                            let kc = ch.key_cache.clone();
-                            let u = ua.to_string();
-                            let seg_clone = next_seg.clone();
-                            let handle = tokio::spawn(async move {
-                                fetch_segment_task(c, kc, seg_clone, u, timeout).await
-                            });
-                            inflight.push_back(PendingSeg {
-                                seg: next_seg,
-                                handle,
-                            });
-                        }
+                        spawn_refill_inflight(ch, ua, td, refill_cap, &mut queue, &mut inflight);
 
                         // Feed segment: burst immediately in 256 KB chunks (prevents 16 MB scratch_pkts bloat!)
                         // until 2 output segments exist OR >= 4.5s of media has been bursted (never drain
@@ -1633,9 +1842,35 @@ async fn run_hls_input(
                                 burst_done = true;
                             }
                         } else {
-                            let bps = if avg_bps > 50_000.0 { avg_bps } else { 500_000.0 };
-                            let step_bytes = (((bps * 0.05) as usize) / TS).max(32) * TS;
+                            // Exact wall-clock per-segment deadline pacing:
+                            // Uses THIS segment's true duration (eliminates VBR UHD jitter & drift)
+                            // while playlist polling runs strictly asynchronously in pl_poll_task.
+                            let raw_dur = if seg_dur > 0.25 && seg_dur <= 30.0 {
+                                seg_dur
+                            } else if avg_bps > 50_000.0 {
+                                (payload.len() as f64 / avg_bps).clamp(0.5, 15.0)
+                            } else {
+                                td.clamp(1.0, 10.0)
+                            };
+                            let trim = if queue.len() >= 3 {
+                                0.90
+                            } else if queue.len() >= 2 {
+                                0.95
+                            } else if queue.is_empty() && inflight.is_empty() {
+                                1.04
+                            } else {
+                                0.995
+                            };
+                            let target_dur = (raw_dur * trim).clamp(0.2, 25.0);
+                            let steps = ((target_dur / 0.05).round() as usize).clamp(4, 400);
+                            let total_pkts = (payload.len() / TS).max(1);
+                            let step_pkts = total_pkts.div_ceil(steps).max(1);
+                            let step_bytes = step_pkts * TS;
+                            let seg_start = Instant::now();
+                            let total_len = payload.len() as f64;
                             let mut off = 0usize;
+                            let mut fatal_err: Option<String> = None;
+
                             while off < payload.len() {
                                 if !ch.alive.load(Ordering::Acquire) {
                                     break;
@@ -1643,150 +1878,98 @@ async fn run_hls_input(
                                 let end = (off + step_bytes).min(payload.len());
                                 ch.feed_ts(&payload[off..end], true);
                                 off = end;
-                                if off < payload.len() {
-                                    // Poll playlist mid-pacing so queue & 2-slot inflight never starve on UHD!
-                                    if Instant::now() >= next_poll
-                                        && queue.len() < 3
-                                        && inflight.len() < 2
-                                    {
-                                        let mut hdrs = HeaderMap::new();
-                                        if let Ok(v) = HeaderValue::from_str(ua) {
-                                            hdrs.insert(USER_AGENT, v);
-                                        }
-                                        if let Some(ref e) = etag {
-                                            if let Ok(v) = HeaderValue::from_str(e) {
-                                                hdrs.insert(IF_NONE_MATCH, v);
+
+                                // Non-blocking background playlist poll check & harvest (zero stall!)
+                                if pl_poll_task.as_ref().is_some_and(|h| h.is_finished()) {
+                                    if let Some(h) = pl_poll_task.take() {
+                                        let res = match h.await {
+                                            Ok(r) => r,
+                                            Err(_) => {
+                                                Err(("playlist task cancelled".to_string(), 0))
+                                            }
+                                        };
+                                        match apply_playlist_result(
+                                            ch,
+                                            master_url,
+                                            ua,
+                                            res,
+                                            &mut pl_url,
+                                            &mut etag,
+                                            &mut last_mod,
+                                            &mut first,
+                                            &mut td,
+                                            &mut last_seq,
+                                            &mut seen,
+                                            &mut queue,
+                                            &mut pl_err,
+                                            &mut next_poll,
+                                        ) {
+                                            PollOutcome::Fatal(e) => {
+                                                fatal_err = Some(e);
+                                                break;
+                                            }
+                                            PollOutcome::Continue | PollOutcome::FollowMaster => {
+                                                spawn_refill_inflight(
+                                                    ch,
+                                                    ua,
+                                                    td,
+                                                    2,
+                                                    &mut queue,
+                                                    &mut inflight,
+                                                );
                                             }
                                         }
-                                        if let Some(ref lm) = last_mod {
-                                            if let Ok(v) = HeaderValue::from_str(lm) {
-                                                hdrs.insert(IF_MODIFIED_SINCE, v);
-                                            }
-                                        }
-                                        if let Ok(Ok(resp)) = tokio::time::timeout(
-                                            Duration::from_secs(5),
-                                            ch.http_client.get(&pl_url).headers(hdrs).send(),
-                                        )
-                                        .await
-                                        {
-                                            let st_c = resp.status().as_u16();
-                                            if st_c == 304 {
-                                                pl_err = 0;
-                                                next_poll = Instant::now()
-                                                    + Duration::from_secs_f64(
-                                                        (td * 0.25).clamp(0.4, 1.2),
-                                                    );
-                                            } else if st_c == 200 {
-                                                if let Some(e) = resp
-                                                    .headers()
-                                                    .get(ETAG)
-                                                    .and_then(|v| v.to_str().ok())
-                                                {
-                                                    etag = Some(e.to_string());
-                                                }
-                                                if let Some(lm) = resp
-                                                    .headers()
-                                                    .get(LAST_MODIFIED)
-                                                    .and_then(|v| v.to_str().ok())
-                                                {
-                                                    last_mod = Some(lm.to_string());
-                                                }
-                                                let final_u = resp.url().to_string();
-                                                if let Ok(text) = resp.text().await {
-                                                    if let Ok(ParsedPlaylist::Media {
-                                                        target_duration,
-                                                        has_media_sequence,
-                                                        segments,
-                                                        ..
-                                                    }) = parse_m3u8(&text, &final_u)
-                                                    {
-                                                        if target_duration > 0.0 {
-                                                            td = target_duration;
-                                                        }
-                                                        let mut added_mid = 0usize;
-                                                        for s in segments {
-                                                            let dk = seg_dedup_key(&s.url);
-                                                            let is_new = if has_media_sequence {
-                                                                s.seq > last_seq
-                                                            } else {
-                                                                !seen.contains(dk)
-                                                            };
-                                                            if is_new && queue.len() < 24 {
-                                                                seen.insert(dk);
-                                                                if s.seq > last_seq {
-                                                                    last_seq = s.seq;
-                                                                }
-                                                                queue.push_back(s);
-                                                                added_mid += 1;
-                                                            }
-                                                        }
-                                                        pl_err = 0;
-                                                        let td2 = if td > 0.0 { td } else { 6.0 };
-                                                        let wait_s = if added_mid > 0 {
-                                                            (td2 * 0.42).clamp(0.3, 1.8)
-                                                        } else {
-                                                            (td2 * 0.22).clamp(0.4, 1.1)
-                                                        };
-                                                        next_poll = Instant::now()
-                                                            + Duration::from_secs_f64(wait_s);
-                                                        while inflight.len() < 2 {
-                                                            let Some(ns) = queue.pop_front() else {
-                                                                break;
-                                                            };
-                                                            let timeout = Duration::from_secs_f64(
-                                                                (td * 1.5 + 3.0).clamp(6.0, 24.0),
-                                                            );
-                                                            let c = ch.http_client.clone();
-                                                            let kc = ch.key_cache.clone();
-                                                            let u = ua.to_string();
-                                                            let sc = ns.clone();
-                                                            let h = tokio::spawn(async move {
-                                                                fetch_segment_task(
-                                                                    c, kc, sc, u, timeout,
-                                                                )
-                                                                .await
-                                                            });
-                                                            inflight.push_back(PendingSeg {
-                                                                seg: ns,
-                                                                handle: h,
-                                                            });
-                                                        }
-                                                    }
-                                                }
-                                            } else {
-                                                next_poll = Instant::now()
-                                                    + Duration::from_millis(500);
-                                            }
-                                        } else {
-                                            next_poll =
-                                                Instant::now() + Duration::from_millis(500);
-                                        }
-                                        continue;
                                     }
-                                    let sleep_ms = if queue.len() >= 2 { 35 } else { 48 };
-                                    tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
+                                } else if pl_poll_task.is_none()
+                                    && Instant::now() >= next_poll
+                                    && queue.len() < 4
+                                    && (queue.len() + inflight.len()) < 4
+                                {
+                                    pl_poll_task = Some(tokio::spawn(fetch_playlist_once(
+                                        ch.http_client.clone(),
+                                        pl_url.clone(),
+                                        ua.to_string(),
+                                        etag.clone(),
+                                        last_mod.clone(),
+                                        Duration::from_secs(6),
+                                    )));
                                 }
+
+                                let frac = (off as f64 / total_len).min(1.0);
+                                let deadline = seg_start + Duration::from_secs_f64(target_dur * frac);
+                                let now = Instant::now();
+                                if deadline > now {
+                                    tokio::time::sleep(deadline - now).await;
+                                }
+                            }
+                            if let Some(e) = fatal_err {
+                                abort_hls_tasks(inflight, &mut pl_poll_task);
+                                return e;
                             }
                         }
                         continue;
                     } else {
                         consec_seg_err += 1;
-                        ch.inner.lock().last_error = format!("segment HTTP {}", status);
+                        let mut st = ch.inner.lock();
+                        st.disc_pending = true;
+                        st.last_error = format!("segment HTTP {}", status);
                     }
                 }
                 Ok(Err(e)) => {
                     consec_seg_err += 1;
-                    ch.inner.lock().last_error = e;
+                    let mut st = ch.inner.lock();
+                    st.disc_pending = true;
+                    st.last_error = e;
                 }
                 Err(_) => {
                     consec_seg_err += 1;
-                    ch.inner.lock().last_error = "segment task cancelled".to_string();
+                    let mut st = ch.inner.lock();
+                    st.disc_pending = true;
+                    st.last_error = "segment task cancelled".to_string();
                 }
             }
             if consec_seg_err >= 8 {
-                for p in inflight {
-                    p.handle.abort();
-                }
+                abort_hls_tasks(inflight, &mut pl_poll_task);
                 return ch.inner.lock().last_error.clone();
             }
         } else {
@@ -1803,9 +1986,7 @@ async fn run_hls_input(
         let last_data_age = ch.now_s() - ch.inner.lock().last_data;
         let max_idle = (td * 3.5).max(18.0);
         if last_data_age > max_idle {
-            for p in inflight {
-                p.handle.abort();
-            }
+            abort_hls_tasks(inflight, &mut pl_poll_task);
             return "HLS no data timeout".to_string();
         }
     }
@@ -1937,5 +2118,74 @@ mod tests {
             "TARGETDURATION should stay >= 2s, got:\n{}",
             pl
         );
+    }
+
+    #[test]
+    fn hls_psi_cc_stays_monotonic_across_segments() {
+        let client = Client::new();
+        let ch = Channel::new(
+            "psi1".into(),
+            "PSI Test".into(),
+            vec!["http://127.0.0.1:9999/psi.ts".into()],
+            vec![],
+            2.0,
+            5,
+            false,
+            20.0,
+            false,
+            String::new(),
+            String::new(),
+            None,
+            client,
+            AesKeyCache::new(),
+            Instant::now(),
+        );
+        let mut st = ch.inner.lock();
+        st.ts.npmt = 1;
+        st.ts.pmt_pid[0] = 0x100;
+
+        let make_pkt = |pid: u16, cc: u8| {
+            let mut p = [0xFFu8; TS];
+            p[0] = 0x47;
+            p[1] = ((pid >> 8) & 0x1F) as u8;
+            p[2] = (pid & 0xFF) as u8;
+            p[3] = 0x10 | (cc & 0x0F);
+            p
+        };
+
+        // Segment 0: prefix PAT(0)+PMT(0), in-stream PAT(9)+PMT(4), plus dummy video packets
+        st.cseg.extend_from_slice(&make_pkt(0, 0));
+        st.cseg.extend_from_slice(&make_pkt(0x100, 0));
+        st.cseg.extend_from_slice(&make_pkt(0, 9));
+        st.cseg.extend_from_slice(&make_pkt(0x100, 4));
+        for i in 0..8u8 {
+            st.cseg.extend_from_slice(&make_pkt(0x101, i));
+        }
+        assert!(seg_finish(&mut st, 2.0, 5, 10.0, 2.0));
+
+        // Segment 1: prefix PAT(0)+PMT(0), in-stream PAT(10)+PMT(5), plus dummy video packets
+        st.cseg.extend_from_slice(&make_pkt(0, 0));
+        st.cseg.extend_from_slice(&make_pkt(0x100, 0));
+        st.cseg.extend_from_slice(&make_pkt(0, 10));
+        st.cseg.extend_from_slice(&make_pkt(0x100, 5));
+        for i in 8..16u8 {
+            st.cseg.extend_from_slice(&make_pkt(0x101, i));
+        }
+        assert!(seg_finish(&mut st, 2.0, 5, 12.0, 2.0));
+
+        let mut pat_ccs = Vec::new();
+        let mut pmt_ccs = Vec::new();
+        for seg in &st.segs {
+            for pkt in seg.data.chunks_exact(TS) {
+                let pid = (((pkt[1] & 0x1F) as u16) << 8) | pkt[2] as u16;
+                if pid == 0 {
+                    pat_ccs.push(pkt[3] & 0x0F);
+                } else if pid == 0x100 {
+                    pmt_ccs.push(pkt[3] & 0x0F);
+                }
+            }
+        }
+        assert_eq!(pat_ccs, vec![0, 1, 2, 3]);
+        assert_eq!(pmt_ccs, vec![0, 1, 2, 3]);
     }
 }

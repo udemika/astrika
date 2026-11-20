@@ -132,10 +132,10 @@ impl AppState {
             .dns_resolver(dns)
             .danger_accept_invalid_certs(!verify_tls)
             .connect_timeout(Duration::from_secs(6))
-            .pool_max_idle_per_host(8)
-            .pool_idle_timeout(Duration::from_secs(35))
+            .pool_max_idle_per_host(12)
+            .pool_idle_timeout(Duration::from_secs(15))
             .tcp_nodelay(true)
-            .tcp_keepalive(Duration::from_secs(30))
+            .tcp_keepalive(Duration::from_secs(15))
             .gzip(true)
             .redirect(reqwest::redirect::Policy::limited(8))
             .build()
@@ -1109,7 +1109,7 @@ async fn handle_media_play_ts(
     );
     ch.nclients.fetch_add(1, Ordering::Relaxed);
 
-    let (tx, mut rx) = mpsc::channel::<Result<Frame<Bytes>, Infallible>>(4);
+    let (tx, mut rx) = mpsc::channel::<Result<Frame<Bytes>, Infallible>>(16);
     let ch_task = Arc::clone(&ch);
     let st_task = Arc::clone(state);
 
@@ -1195,7 +1195,7 @@ async fn handle_media_play_ts(
                     pos = st.ts.pick_start(ch_task.now_s());
                     jp = Some(st.ts.client_prefix(pos));
                 }
-                let c = st.ts.ring_read_chunk(pos, 512 * 1024);
+                let c = st.ts.ring_read_chunk(pos, 128 * 1024);
                 pos += c.len() as u64;
                 (c, jp)
             };
@@ -1228,7 +1228,7 @@ async fn handle_media_play_ts(
             tokio::select! {
                 _ = ch_task.data_notify.notified() => {},
                 _ = cancel.notified() => return,
-                _ = tokio::time::sleep(Duration::from_millis(100)) => {},
+                _ = tokio::time::sleep(Duration::from_millis(80)) => {},
             }
         }
     });
@@ -2992,16 +2992,39 @@ fn build_cluster_auth_query(user: &str, pass: &str) -> Option<String> {
 
 fn detect_remote_hls_enabled(rcfg: &Value) -> bool {
     let Some(settings) = rcfg.get("settings").and_then(|v| v.as_object()) else {
-        return true;
+        return false;
     };
     if settings.contains_key("http_play_hls") {
-        return get_bool_field(rcfg.get("settings"), "http_play_hls", true);
+        return get_bool_field(rcfg.get("settings"), "http_play_hls", false);
     }
-    // Cesbo Astra omits `http_play_hls` when only `http_play_stream: true` is enabled.
-    if settings.contains_key("http_play_stream") {
-        return false;
+    false
+}
+
+/// Extract HTTP/HTTPS output URLs from a remote cluster stream config and rewrite
+/// bind/loopback hosts (`0.0.0.0`, `0`, `127.0.0.1`, `localhost`, `::`) to `remote_host`.
+fn extract_cluster_output_urls(stream: &Value, remote_host: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let Some(arr) = stream.get("output").and_then(|v| v.as_array()) else {
+        return out;
+    };
+    for item in arr {
+        let Some(raw) = item.as_str() else {
+            continue;
+        };
+        let base = raw.split('#').next().unwrap_or(raw).trim();
+        let low = base.to_ascii_lowercase();
+        if !low.starts_with("http://") && !low.starts_with("https://") {
+            continue;
+        }
+        if let Ok(mut u) = url::Url::parse(base) {
+            let h = u.host_str().unwrap_or("");
+            if matches!(h, "" | "0" | "0.0.0.0" | "127.0.0.1" | "localhost" | "::" | "[::]") {
+                let _ = u.set_host(Some(remote_host));
+            }
+            out.push(u.into());
+        }
     }
-    true
+    out
 }
 
 async fn sync_cluster_once(state: &Arc<AppState>) {
@@ -3012,6 +3035,8 @@ async fn sync_cluster_once(state: &Arc<AppState>) {
         .and_then(|v| v.as_array())
         .cloned()
         .unwrap_or_default();
+
+    let mut enabled_hosts: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     // Fetch all enabled cluster nodes concurrently so a slow/offline node never stalls others
     let mut futs = Vec::new();
@@ -3025,6 +3050,7 @@ async fn sync_cluster_once(state: &Arc<AppState>) {
         }
         let rport = get_u16(&srv, "port", 8000);
         let hp = format!("{}:{}", rhost, rport);
+        enabled_hosts.insert(hp.clone());
         let ruser = srv.get("user").and_then(|v| v.as_str()).unwrap_or("").to_string();
         let rpass = srv.get("pass").and_then(|v| v.as_str()).unwrap_or("").to_string();
         let auth_header = if !ruser.is_empty() {
@@ -3048,7 +3074,7 @@ async fn sync_cluster_once(state: &Arc<AppState>) {
             if let Some(ref ah) = auth_header {
                 req = req.header(AUTHORIZATION, ah.as_str());
             }
-            let Ok(Ok(resp)) = tokio::time::timeout(Duration::from_secs(4), req.send()).await else {
+            let Ok(Ok(resp)) = tokio::time::timeout(Duration::from_secs(8), req.send()).await else {
                 return None;
             };
             if resp.status().as_u16() != 200 {
@@ -3056,19 +3082,24 @@ async fn sync_cluster_once(state: &Arc<AppState>) {
             }
             let raw_bytes = resp.bytes().await.ok()?;
             let rcfg = serde_json::from_slice::<Value>(&raw_bytes).ok()?;
-            Some((hp, auth_header, auth_query, rcfg))
+            Some((rhost, hp, auth_header, auth_query, rcfg))
         });
     }
 
     let results = futures_util::future::join_all(futs).await;
 
+    let mut synced_hosts: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut new_streams = HashMap::new();
     let mut new_aliases = HashMap::new();
     let mut new_plain = HashMap::new();
 
+    // Preserve previously discovered streams for enabled nodes that temporarily timed out
+    // so active cluster viewers are NEVER disconnected by a single /control/ hiccup!
     for item in results.into_iter().flatten() {
-        let (hp, auth_header, auth_query, rcfg) = item;
+        let (rhost, hp, auth_header, auth_query, rcfg) = item;
+        synced_hosts.insert(hp.clone());
         let remote_hls_enabled = detect_remote_hls_enabled(&rcfg);
+        let remote_play_stream = get_bool_field(rcfg.get("settings"), "http_play_stream", false);
         let Some(rms) = rcfg.get("make_stream").and_then(|v| v.as_array()) else {
             continue;
         };
@@ -3092,7 +3123,22 @@ async fn sync_cluster_once(state: &Arc<AppState>) {
                 display_play_url,
                 auth_query.as_deref().unwrap_or("")
             );
-            proxied["input"] = json!([display_play_url]);
+            let out_urls = extract_cluster_output_urls(s, &rhost);
+            let mut urls = Vec::with_capacity(1 + out_urls.len());
+            if remote_play_stream || out_urls.is_empty() {
+                urls.push(play_url);
+                for ou in &out_urls {
+                    urls.push(ou.clone());
+                }
+                proxied["input"] = json!([display_play_url]);
+            } else {
+                // Remote node disabled /play/{id} (e.g. Cesbo Astra publishing via custom HTTP output port)
+                for ou in &out_urls {
+                    urls.push(ou.clone());
+                }
+                urls.push(play_url);
+                proxied["input"] = json!([out_urls[0]]);
+            }
 
             new_aliases.insert((hp.clone(), orig_id.to_string()), eff_id.clone());
             new_plain
@@ -3104,7 +3150,7 @@ async fn sync_cluster_once(state: &Arc<AppState>) {
                 Some(existing) => {
                     existing.name != name
                         || existing.auth_header != auth_header
-                        || existing.urls.first().map(|u| u.as_str()) != Some(play_url.as_str())
+                        || existing.urls != urls
                 }
                 None => true,
             };
@@ -3115,12 +3161,12 @@ async fn sync_cluster_once(state: &Arc<AppState>) {
                 let ch = Channel::new(
                     eff_id.clone(),
                     name.to_string(),
-                    vec![play_url],
+                    urls,
                     vec![],
                     snap.hls_seg_dur,
                     snap.hls_seg_keep,
                     false,
-                    20.0,
+                    30.0,
                     true,
                     hp.clone(),
                     orig_id.to_string(),
@@ -3146,7 +3192,24 @@ async fn sync_cluster_once(state: &Arc<AppState>) {
         }
     }
 
-    // Remove stale cluster channels
+    // Carry forward streams for enabled cluster nodes whose /control/ request failed transiently
+    {
+        let prev = state.cluster_streams.read();
+        for (eff_id, cs) in prev.iter() {
+            if enabled_hosts.contains(&cs.host_port)
+                && !synced_hosts.contains(&cs.host_port)
+                && !new_streams.contains_key(eff_id)
+            {
+                new_aliases.insert((cs.host_port.clone(), cs.orig_id.clone()), eff_id.clone());
+                new_plain
+                    .entry(cs.orig_id.clone())
+                    .or_insert_with(|| eff_id.clone());
+                new_streams.insert(eff_id.clone(), cs.clone());
+            }
+        }
+    }
+
+    // Remove stale cluster channels only for disabled nodes or streams genuinely removed on a synced node
     let stale: Vec<String> = state
         .channels
         .iter()
@@ -3309,6 +3372,10 @@ mod tests {
         let cesbo_ts_only = json!({"settings": {"http_play_stream": true}});
         assert!(!detect_remote_hls_enabled(&cesbo_ts_only));
 
+        // Cesbo Astra with neither http_play_stream nor http_play_hls (output-only node)
+        let cesbo_out_only = json!({"settings": {"http_keep_active": "-1"}});
+        assert!(!detect_remote_hls_enabled(&cesbo_out_only));
+
         // Cesbo Astra / Astrika with http_play_hls: true
         let with_hls = json!({"settings": {"http_play_stream": true, "http_play_hls": true}});
         assert!(detect_remote_hls_enabled(&with_hls));
@@ -3316,5 +3383,16 @@ mod tests {
         // Explicit false
         let disabled_hls = json!({"settings": {"http_play_hls": false}});
         assert!(!detect_remote_hls_enabled(&disabled_hls));
+
+        // Output URL rewriting for wildcard bind addresses on remote cluster nodes
+        let st = json!({"output": ["http://0.0.0.0:7000/PERVIY_KANAL_T2", "udp://239.0.0.1:1234", "http://127.0.0.1:8080/live#keep"]});
+        let urls = extract_cluster_output_urls(&st, "185.50.148.23");
+        assert_eq!(
+            urls,
+            vec![
+                "http://185.50.148.23:7000/PERVIY_KANAL_T2".to_string(),
+                "http://185.50.148.23:8080/live".to_string(),
+            ]
+        );
     }
 }
